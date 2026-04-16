@@ -1,335 +1,3227 @@
-function doGet() {
-  return HtmlService.createTemplateFromFile('index')
+// --- CONFIGURATION ---
+const SUPABASE_URL = PropertiesService.getScriptProperties().getProperty('SUPABASE_URL');
+// 🟢 กุญแจชาวบ้าน (สำหรับยื่นให้ยามหน้าประตู API)
+const SUPABASE_ANON_KEY = PropertiesService.getScriptProperties().getProperty('SUPABASE_ANON_KEY'); 
+// 🔴 กุญแจพระเจ้า (สำหรับเจาะทะลุ RLS บันทึกข้อมูล)
+const SUPABASE_KEY = PropertiesService.getScriptProperties().getProperty('SUPABASE_KEY'); 
+
+function doGet(e) {
+  // ตรวจสอบ Action จากอีเมล
+  if (e.parameter && e.parameter.action) {
+    const act = e.parameter.action;
+    
+    // กรณี Bulk Reject: ต้องเปิดฟอร์มเพื่อถามเหตุผล (รวม)
+    if (act === 'bulk_reject') {
+        return createBulkRejectForm(e); 
+    }
+    
+    // กรณี Approve All / Confirm Bulk Reject -> Process
+    if (act === 'approve' || act === 'reject' || act === 'confirm_reject' || 
+        act === 'bulk_approve' || act === 'confirm_bulk_reject') {
+      return processEmailAction(e);
+    }
+  }
+
+  // กรณีปกติ: เปิดหน้า Web App
+  return HtmlService.createTemplateFromFile('Index')
     .evaluate()
-    .setTitle('ระบบบริหารการจัดซื้อและคลังสินค้า')
+    .setTitle('PurchaseHub System')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
 
-const SHEET_ID = SpreadsheetApp.getActiveSpreadsheet().getId();
-
-// --- Helper: หา/สร้าง Sheet ---
-function getOrCreateSheet(ss, sheetName) {
-  let sheet = ss.getSheetByName(sheetName);
-  if (!sheet) {
-    sheet = ss.insertSheet(sheetName);
-    if (sheetName === 'Inventory') {
-      sheet.appendRow(['id', 'name', 'qty', 'unit', 'price', 'lastUpdated', 'image']);
-    } else if (sheetName === 'Assets') {
-      sheet.appendRow(['id', 'name', 'serial', 'status', 'holder', 'price', 'lastUpdated', 'image', 'sourceDoc']);
-    } else if (sheetName === 'Logs') {
-      sheet.appendRow(['date', 'action', 'item', 'change', 'user', 'docRef', 'note']);
-    } else if (sheetName === 'Requests') {
-      sheet.appendRow(['id', 'requester', 'type', 'job', 'status', 'items', 'dateRequired', 'created', 'history', 'attachment', 'docNumber', 'urgency']);
-    }
-  }
-  return sheet;
-}
-
-// --- API: ดึงข้อมูล Request ---
-function getRequests() {
-  const ss = SpreadsheetApp.openById(SHEET_ID);
-  const sheet = getOrCreateSheet(ss, 'Requests');
-  if (sheet.getLastRow() <= 1) return [];
-
-  const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 12).getValues();
+function callSupabase(tableName, method, payload = null, params = '') {
+  const table = tableName.toLowerCase(); 
+  let url = `${SUPABASE_URL}/rest/v1/${table}${params}`;
   
-  return data.map(function(row) {
-    return {
-      id: row[0],
-      requester: row[1],
-      type: row[2],
-      job: row[3],
-      status: row[4],
-      items: row[5] ? JSON.parse(row[5]) : [],
-      dateRequired: row[6] ? Utilities.formatDate(new Date(row[6]), "GMT+7", "yyyy-MM-dd") : '',
-      created: row[7] ? Utilities.formatDate(new Date(row[7]), "GMT+7", "dd/MM/yyyy") : '',
-      history: row[8] ? JSON.parse(row[8]) : [],
-      attachment: row[9],
-      docNumber: row[10],
-      urgency: row[11] || 'Normal'
-    };
-  }).reverse();
-}
-
-// --- API: ดึงข้อมูลสต็อก ---
-function getStockData() {
-  const ss = SpreadsheetApp.openById(SHEET_ID);
-  const invSheet = getOrCreateSheet(ss, 'Inventory');
-  const astSheet = getOrCreateSheet(ss, 'Assets');
-
-  let inventory = [];
-  if (invSheet.getLastRow() > 1) {
-    const data = invSheet.getRange(2, 1, invSheet.getLastRow()-1, 7).getValues();
-    inventory = data.map(function(r) {
-      return { 
-        id: r[0], name: r[1], qty: r[2], unit: r[3], price: r[4], 
-        lastUpdated: Utilities.formatDate(new Date(r[5]), "GMT+7", "dd/MM/yyyy HH:mm"), 
-        image: r[6] 
-      };
-    });
-  }
-
-  let assets = [];
-  if (astSheet.getLastRow() > 1) {
-    const data = astSheet.getRange(2, 1, astSheet.getLastRow()-1, 9).getValues();
-    assets = data.map(function(r) {
-      return { 
-        id: r[0], name: r[1], serial: r[2], status: r[3], holder: r[4], price: r[5], 
-        lastUpdated: Utilities.formatDate(new Date(r[6]), "GMT+7", "dd/MM/yyyy"), 
-        image: r[7], sourceDoc: r[8] 
-      };
-    });
-  }
-
-  return { inventory: inventory, assets: assets };
-}
-
-// --- API: ดึงประวัติ (Logs) ---
-function getHistoryLogs(filterItemName) {
-  const ss = SpreadsheetApp.openById(SHEET_ID);
-  const logSheet = getOrCreateSheet(ss, 'Logs');
+  const options = {
+    method: method,
+    headers: {
+      'apikey': SUPABASE_ANON_KEY,        // 🟢 ใช้ Anon Key ให้ยามหน้าด่านผ่าน
+      'Authorization': 'Bearer ' + SUPABASE_KEY, // 🔴 ใช้ Secret Key เจาะทะลุ RLS
+      'Content-Type': 'application/json',
+      'Prefer': 'return=minimal',
+      'User-Agent': 'PurchaseHub-Script/1.0'
+    },
+    muteHttpExceptions: true
+  };
   
-  if (logSheet.getLastRow() <= 1) return [];
-
-  const data = logSheet.getRange(2, 1, logSheet.getLastRow()-1, 7).getValues();
-  let logs = data.map(function(r) {
-    return {
-      date: Utilities.formatDate(new Date(r[0]), "GMT+7", "dd/MM/yyyy HH:mm"),
-      action: r[1],
-      item: r[2],
-      change: r[3],
-      user: r[4],
-      docRef: r[5],
-      note: r[6]
-    };
-  }).reverse();
-
-  if (filterItemName && filterItemName !== 'ALL LOGS') {
-    logs = logs.filter(function(l) { return l.item && l.item.toString().indexOf(filterItemName) > -1; });
+  if (payload) {
+    options.payload = JSON.stringify(payload);
   }
-  return logs;
-}
-
-// --- API: รับของเข้าคลัง ---
-function receiveGoods(formObject) {
-  const ss = SpreadsheetApp.openById(SHEET_ID);
-  const invSheet = getOrCreateSheet(ss, 'Inventory');
-  const astSheet = getOrCreateSheet(ss, 'Assets');
-  const logSheet = getOrCreateSheet(ss, 'Logs');
-  const dateNow = new Date();
-
-  const items = JSON.parse(formObject.itemsJson);
 
   try {
-    items.forEach(function(item) {
-      // 1. Inventory Logic
-      if (item.targetType === 'Inventory') {
-        let imageUrls = [];
-        if (item.images && item.images.length > 0) {
-           item.images.forEach(function(img, idx) {
-              const url = saveFileToDrive(img.data, 'Stock_' + item.name + '_' + idx + '_' + img.name, formObject.reqId);
-              if(url) imageUrls.push(url);
-           });
-        }
-        const imageString = imageUrls.join(',');
-        const finalPrice = item.realPrice || item.price;
-        const receiveQty = parseInt(item.qty);
-
-        const data = invSheet.getDataRange().getValues();
-        let found = false;
-        for (let i = 1; i < data.length; i++) {
-          if (data[i][1] === item.name) { 
-            const currentQty = Number(data[i][2]) || 0;
-            invSheet.getRange(i + 1, 3).setValue(currentQty + receiveQty);
-            invSheet.getRange(i + 1, 5).setValue(finalPrice);
-            invSheet.getRange(i + 1, 6).setValue(dateNow);
-            if(imageString) invSheet.getRange(i + 1, 7).setValue(imageString);
-            found = true;
-            break;
-          }
-        }
-        if (!found) {
-          const newId = 'INV-' + String(invSheet.getLastRow()).padStart(3, '0');
-          invSheet.appendRow([newId, item.name, receiveQty, item.unit, finalPrice, dateNow, imageString]);
-        }
-        
-        logSheet.appendRow([dateNow, 'Stock In', item.name, '+' + receiveQty, formObject.user, formObject.reqId, 'รับของเข้าคลัง']);
-      } 
-      
-      // 2. Asset Logic
-      else if (item.targetType === 'Asset') {
-        item.assetsList.forEach(function(ast, idx) {
-           let assetImgUrls = [];
-           if (ast.images && ast.images.length > 0) {
-              ast.images.forEach(function(img, imgIdx) {
-                 const url = saveFileToDrive(img.data, 'Asset_' + (ast.id || 'NoID') + '_' + idx + '_' + imgIdx, formObject.reqId);
-                 if(url) assetImgUrls.push(url);
-              });
-           }
-           const assetImgString = assetImgUrls.join(',');
-           const assetPrice = ast.realPrice || item.price;
-
-           astSheet.appendRow([ast.id, ast.name, ast.serial || '-', 'Available', '-', assetPrice, dateNow, assetImgString, formObject.reqId]);
-           
-           logSheet.appendRow([dateNow, 'Register Asset', ast.name, 'New', formObject.user, ast.id, 'รับทรัพย์สิน (' + ast.serial + ')']);
-        });
-      }
-    });
-
-    updateRequestStatus(formObject.reqId, 'Completed', formObject.user, 'Received Goods');
-    return { success: true, message: 'บันทึกรับของเรียบร้อย' };
-  } catch (e) {
-    return { success: false, message: 'Error: ' + e.toString() };
-  }
-}
-
-// --- API: สร้างใบขอซื้อ ---
-function createRequest(formObject) {
-  try {
-    const ss = SpreadsheetApp.openById(SHEET_ID);
-    const sheet = getOrCreateSheet(ss, 'Requests');
-    const lastRow = sheet.getLastRow();
-    const newId = 'REQ-' + String(lastRow).padStart(3, '0');
-    const createdDate = new Date();
-
-    let fileUrl = '';
-    if (formObject.fileData && formObject.fileName) {
-      fileUrl = saveFileToDrive(formObject.fileData, formObject.fileName, newId);
-    }
-
-    let items = formObject.items;
-    items = items.map(function(item, idx) {
-      if (item.imageData && item.imageName) {
-         const itemUrl = saveFileToDrive(item.imageData, 'Item' + (idx+1) + '_' + item.imageName, newId);
-         delete item.imageData; delete item.imageName;
-         item.imageUrl = itemUrl;
-      }
-      return item;
-    });
-
-    const historyLog = [{
-      date: Utilities.formatDate(createdDate, "GMT+7", "dd/MM/yyyy HH:mm"),
-      action: 'สร้างคำขอ',
-      user: formObject.requester,
-      note: 'Initial Request'
-    }];
-
-    const rowData = [
-      newId, formObject.requester, formObject.type, formObject.job, formObject.status,
-      JSON.stringify(items), formObject.dateRequired, createdDate,
-      JSON.stringify(historyLog), fileUrl, '', formObject.urgency || 'Normal'
-    ];
+    const response = UrlFetchApp.fetch(url, options);
+    const responseCode = response.getResponseCode();
     
-    sheet.appendRow(rowData);
-    return { success: true, message: 'บันทึกข้อมูลสำเร็จ' };
+    if (responseCode >= 400) {
+      const errorMsg = `Supabase Error (${responseCode}): ${response.getContentText()}`;
+      console.error(errorMsg);
+      throw new Error(errorMsg);
+    }
+    
+    return response.getContentText();
+    
   } catch (e) {
-    return { success: false, message: 'Error: ' + e.toString() };
+    console.error("❌ Connection Failed: " + e.toString());
+    throw new Error("Connection Failed: " + e.toString());
   }
 }
 
-// --- API: แก้ไขข้อมูล ---
-function editRequest(formObject) {
-  const ss = SpreadsheetApp.openById(SHEET_ID);
-  const sheet = getOrCreateSheet(ss, 'Requests');
-  const data = sheet.getRange(2, 1, sheet.getLastRow()-1, 1).getValues();
-  
-  for (let i = 0; i < data.length; i++) {
-    if (data[i][0] == formObject.id) {
-      const rowIndex = i + 2;
-      const historyRange = sheet.getRange(rowIndex, 9);
-      let history = JSON.parse(historyRange.getValue() || '[]');
-      
-      history.push({
-        date: Utilities.formatDate(new Date(), "GMT+7", "dd/MM/yyyy HH:mm"),
-        action: 'แก้ไขข้อมูล',
-        user: formObject.requester,
-        note: 'Edit Draft / Re-submit'
-      });
+function createRejectForm(e) {
+  const reqId = e.parameter.id;
+  const role = e.parameter.role;
+  const approver = e.parameter.approver;
+  const scriptUrl = ScriptApp.getService().getUrl();
 
-      let fileUrl = sheet.getRange(rowIndex, 10).getValue();
-      if (formObject.fileData && formObject.fileName) {
-        fileUrl = saveFileToDrive(formObject.fileData, formObject.fileName, formObject.id);
-        sheet.getRange(rowIndex, 10).setValue(fileUrl);
+  const html = `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <base target="_top">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: 'Sarabun', sans-serif; background-color: #f3f4f6; display: flex; justify-content: center; padding-top: 50px; }
+          .card { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 90%; max-width: 400px; }
+          h2 { color: #d93025; margin-top: 0; }
+          textarea { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 5px; margin: 15px 0; font-family: inherit; }
+          button { background-color: #d93025; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; width: 100%; font-size: 16px; }
+          button:hover { background-color: #b02015; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h2>❌ ยืนยันการไม่อนุมัติ</h2>
+          <p>เอกสาร: <strong>${reqId}</strong></p>
+          <p>กรุณาระบุเหตุผล (Note):</p>
+          
+          <form id="rejectForm">
+            <textarea id="reason" rows="4" placeholder="ระบุสาเหตุที่ไม่อนุมัติ..." required></textarea>
+            <button type="submit">ยืนยัน (Confirm Reject)</button>
+          </form>
+
+          <script>
+            document.getElementById('rejectForm').onsubmit = function(e) {
+              e.preventDefault();
+              var reason = document.getElementById('reason').value;
+              var btn = document.querySelector('button');
+              btn.disabled = true;
+              btn.innerText = 'กำลังบันทึก...';
+
+              // Redirect กลับไปที่ Script พร้อมเหตุผล
+              var finalUrl = "${scriptUrl}?action=confirm_reject" + 
+                             "&id=${reqId}" + 
+                             "&role=${role}" + 
+                             "&approver=${approver}" + 
+                             "&note=" + encodeURIComponent(reason);
+              
+              window.top.location.href = finalUrl;
+            };
+          </script>
+        </div>
+      </body>
+    </html>
+  `;
+  
+  return HtmlService.createHtmlOutput(html);
+}
+
+// ฟังก์ชันประมวลผลการอนุมัติ (แก้ไขสถานะ Local/HO และข้อความ Log ให้ถูกต้อง)
+function processEmailAction(e) {
+  const action = e.parameter.action;
+  
+  // 1. แปลง IDs เป็น Array
+  let targetIds = [];
+  if (e.parameter.ids) {
+      targetIds = e.parameter.ids.split(',');
+  } else if (e.parameter.id) {
+      targetIds = [e.parameter.id];
+  }
+
+  const approver = e.parameter.approver; // Email ของคนกด
+  const urlRole = e.parameter.role;
+  const customNote = e.parameter.note || ''; 
+
+  console.log(`[ProcessEmail] Action: ${action} | Targets: ${targetIds.length} | Approver: ${approver}`);
+
+  // 2. โหลดข้อมูล
+  const allUsers = getSheetData('Users');
+  const requests = getSheetData('Requests');
+  
+  // 3. เตรียมชื่อผู้ดำเนินการ
+  let userObj = allUsers.find(u => u.email && approver.toLowerCase().includes(u.email.toLowerCase()));
+  let userDisplay = approver; 
+  
+if (userObj) {
+      
+      userDisplay = `${userObj.empId} ${userObj.firstName} ${userObj.lastName} (${approver})`;
+  }
+
+  let successCount = 0;
+  let failCount = 0;
+  let skippedCount = 0;
+
+  // 4. วนลูปทำรายการ
+  targetIds.forEach(reqId => {
+      const reqIndex = requests.findIndex(r => r.id === reqId);
+      if (reqIndex === -1) { failCount++; return; }
+
+      let req = requests[reqIndex];
+      
+      // ป้องกันทำซ้ำ
+      if (req.status !== 'Pending Head' && req.status !== 'Pending PM') {
+           skippedCount++;
+           return;
       }
 
-      let items = formObject.items;
-      items = items.map(function(item, idx) {
-        if (item.imageData && item.imageName) {
-           const itemUrl = saveFileToDrive(item.imageData, 'Item' + (idx+1) + '_' + item.imageName, formObject.id);
-           delete item.imageData; delete item.imageName;
-           item.imageUrl = itemUrl;
-        }
-        return item;
-      });
+      // -- ตรวจสอบสิทธิ์ --
+      const isWithdrawOrBorrow = (req.type === 'Withdraw' || req.type === 'Borrow');
+      let isValidRole = false;
+      let currentRole = urlRole;
 
-      sheet.getRange(rowIndex, 3).setValue(formObject.type);
-      sheet.getRange(rowIndex, 4).setValue(formObject.job);
-      sheet.getRange(rowIndex, 5).setValue(formObject.status);
-      sheet.getRange(rowIndex, 6).setValue(JSON.stringify(items));
-      sheet.getRange(rowIndex, 7).setValue(formObject.dateRequired);
-      sheet.getRange(rowIndex, 9).setValue(JSON.stringify(history));
-      sheet.getRange(rowIndex, 12).setValue(formObject.urgency);
+      // ถ้ามาจากปุ่ม Bulk (Batch) ให้คำนวณ Role เอง
+      if (urlRole === 'Batch' || !urlRole) {
+          const userPerms = userObj?.permissions?.[req.job] || [];
+          const isL1 = userPerms.includes(8) || userObj?.isSuperAdmin;
+          const isL2 = userPerms.includes(9) || userObj?.isSuperAdmin;
 
-      return { success: true, message: 'แก้ไขข้อมูลเรียบร้อย' };
-    }
-  }
-  return { success: false, message: 'ไม่พบรายการที่ต้องการแก้ไข' };
-}
-
-// --- API: อัปเดตสถานะ ---
-function updateRequestStatus(reqId, newStatus, user, note, manualDocNum) {
-  const ss = SpreadsheetApp.openById(SHEET_ID);
-  const sheet = getOrCreateSheet(ss, 'Requests');
-  const data = sheet.getRange(2, 1, sheet.getLastRow()-1, 12).getValues();
-  
-  for (let i = 0; i < data.length; i++) {
-    if (data[i][0] == reqId) {
-      const rowIndex = i + 2;
-      const currentType = data[i][2];
-      const currentDocNum = data[i][10];
-      
-      let history = [];
-      try { history = JSON.parse(data[i][8]); } catch(e) {}
-      
-      history.push({
-        date: Utilities.formatDate(new Date(), "GMT+7", "dd/MM/yyyy HH:mm"),
-        action: newStatus,
-        user: user,
-        note: note || ''
-      });
-
-      if (manualDocNum) {
-         sheet.getRange(rowIndex, 11).setValue(manualDocNum);
-      } else if (newStatus === 'Approved' && currentDocNum === '' && currentType !== 'HO') {
-        let count = 0;
-        for (let j = 0; j < data.length; j++) {
-           if (data[j][2] === currentType && data[j][10] !== '') count++;
-        }
-        const runNo = count + 1;
-        let prefix = currentType === 'Local' ? 'LPO' : 'WID';
-        const docNum = prefix + '-' + Utilities.formatDate(new Date(), "GMT+7", "yyMM") + '-' + String(runNo).padStart(3,'0');
-        sheet.getRange(rowIndex, 11).setValue(docNum);
+          if (req.status === 'Pending Head') {
+              if (isWithdrawOrBorrow && (isL1 || isL2)) { isValidRole = true; currentRole = 'Approver'; }
+              else if (isL1) { isValidRole = true; currentRole = 'Head'; }
+          } 
+          else if (req.status === 'Pending PM' && isL2) {
+              isValidRole = true;
+              currentRole = 'PM';
+          }
+      } else {
+          // ถ้ามาจากปุ่มเดี่ยว (Single)
+          if (urlRole === 'Head' && req.status === 'Pending Head') isValidRole = true;
+          else if (urlRole === 'PM' && req.status === 'Pending PM') isValidRole = true;
+          else if (isWithdrawOrBorrow && urlRole === 'PM' && req.status === 'Pending Head') isValidRole = true;
+          else if (urlRole === 'Approver' && isWithdrawOrBorrow && req.status === 'Pending Head') isValidRole = true;
       }
 
-      sheet.getRange(rowIndex, 5).setValue(newStatus);
-      sheet.getRange(rowIndex, 9).setValue(JSON.stringify(history));
+      if (!isValidRole) { failCount++; return; }
+
+      // -- 5. กำหนด Status และ ข้อความ Log (แก้ไขตรงนี้) --
+      let newStatus = '';
+      let logActionText = ''; 
+      let logNoteText = '';   
       
-      return { success: true };
-    }
-  }
-  return { success: false, message: 'ไม่พบ ID' };
+      const isApprove = action.includes('approve');
+      
+      if (isApprove) {
+          // --- กรณีอนุมัติ ---
+          
+         if (isWithdrawOrBorrow) {
+              // เบิก/ยืม -> จบเลย
+              newStatus = 'Ready to Disburse';
+              // ⭐ แก้ไข: ใช้ข้อความให้ตรงกับ Status Label เพื่อให้ใบเบิกดึงชื่อไปโชว์ในช่องผู้อนุมัติได้
+              logActionText = 'รอจ่ายของ (เบิก/ยืม)';
+          }
+          else if (currentRole === 'Head') {
+              // ✅ Level 1 อนุมัติ -> ส่งต่อให้ L2
+              newStatus = 'Pending PM';
+              logActionText = 'รออนุมัติ Level 2'; 
+          } 
+          else if (currentRole === 'PM') {
+              // ✅ Level 2 อนุมัติ
+              if (req.type === 'Local') {
+                  // ถ้าเป็น Local -> ส่งให้จัดซื้อ Check
+                  // ⭐ แก้ไข: ใช้ Key 'Pending Check' เพื่อให้หน้าเว็บแสดงเป็น "รอฝ่ายจัดซื้อตรวจสอบ (Check)"
+                  newStatus = 'Pending Check';
+                  logActionText = 'รอฝ่ายจัดซื้อตรวจสอบ (Check)'; 
+              } else {
+                  // ถ้าเป็น HO -> จบกระบวนการ
+                  newStatus = 'Approved';
+                  logActionText = 'อนุมัติแล้ว (รอดำเนินการ)'; 
+              }
+          } 
+          else {
+              // Fallback
+              newStatus = 'Ready to Disburse';
+              logActionText = 'อนุมัติแล้ว (รอดำเนินการ)';
+          }
+      } else {
+          // --- กรณีไม่อนุมัติ ---
+          newStatus = 'Rejected';
+          logActionText = 'ไม่อนุมัติ (Rejected)';
+          logNoteText = customNote ? `เหตุผล: ${customNote}` : '';
+      }
+
+      // -- 6. Generate Doc No --
+      if (!req.docNumber && (newStatus === 'Pending PM' || newStatus === 'Approved' || newStatus === 'Pending Check' || newStatus === 'Ready to Disburse')) {
+          const count = getNextDocIndex(requests, req.type, req.purchaseType);
+          req.docNumber = generateDocId(req.type, count, req.purchaseType);
+          if (logNoteText) logNoteText += ' ';
+          logNoteText += `(New Doc No: ${req.docNumber})`;
+      }
+
+      // -- 7. บันทึกข้อมูล --
+      req.status = newStatus;
+      if (!req.history) req.history = [];
+      
+      req.history.push({
+          date: new Date().toLocaleString('th-TH'), 
+          action: logActionText,                    
+          user: userDisplay,                        
+          note: logNoteText                         
+      });
+      
+      saveDataToSheet('Requests', req.id, req);
+      
+     // -- 8. แจ้งเตือน --
+      if (newStatus === 'Pending PM') {
+          try {
+              const pmEmails = findApproverEmails(req.job, 9);
+              if (pmEmails) sendApprovalEmail(req, pmEmails, 'PM');
+          } catch(e) { console.error("Err sending PM email", e); }
+      }
+      
+      try { handleStatusNotification(req); } catch(e){}
+
+      // ⭐⭐⭐ เพิ่มโค้ดดักส่ง LINE ตรงนี้ ⭐⭐⭐
+      try { sendLineGroupNotification(req); } catch(e){}
+
+      successCount++;
+  });
+
+  // -- 9. แสดงผลหน้าเว็บ --
+  const isReject = action.includes('reject');
+  const color = isReject ? 'red' : 'green';
+  const msgTitle = isReject ? 'บันทึกการไม่อนุมัติ' : 'บันทึกการอนุมัติ';
+  
+  let summaryMsg = `<p>ทำรายการสำเร็จ: <strong>${successCount}</strong> รายการ</p>`;
+  if (skippedCount > 0) summaryMsg += `<p style="color:gray; font-size: 12px;">(ข้ามไป <strong>${skippedCount}</strong> รายการ เนื่องจากสถานะเปลี่ยนไปแล้ว)</p>`;
+  if (failCount > 0) summaryMsg += `<p style="color:orange; font-size: 12px;">(ทำรายการไม่ได้/ไม่มีสิทธิ์: ${failCount} รายการ)</p>`;
+  
+  return HtmlService.createHtmlOutput(`
+    <div style="font-family: 'Sarabun', sans-serif; text-align: center; padding: 50px;">
+      <h1 style="color: ${color};">${msgTitle} เสร็จสิ้น</h1>
+      ${summaryMsg}
+      <p style="color:#555;">ระบบได้บันทึกประวัติและลายเซ็นอิเล็กทรอนิกส์เรียบร้อยแล้ว</p>
+      <button onclick="window.close()" style="padding: 10px 25px; margin-top:20px; cursor: pointer; border:none; background:#333; color:white; border-radius:5px;">ปิดหน้านี้</button>
+    </div>
+  `);
 }
 
-// --- Helper: Save File ---
-function saveFileToDrive(base64Data, fileName, reqId) {
+function findApproverEmails(projectName, permId) {
+  console.log(`[FindApprover] ===== START =====`);
+  console.log(`[FindApprover] Project: ${projectName}, Permission ID: ${permId}`);
+  
+  const users = getSheetData('Users');
+  console.log(`[FindApprover] Total users in database: ${users.length}`);
+
+  const approvers = users.filter(u => {
+    // ⭐ เช็ค Status ต้องเป็น Activated เท่านั้น
+    if (u.status !== 'Activated') {
+      return false;
+    }
+
+
+
+    // เช็คสิทธิ์ในโครงการ
+    if (u.permissions && u.permissions[projectName]) {
+      const userPerms = u.permissions[projectName].map(Number); 
+      const targetPerm = Number(permId);
+
+
+      
+const hasRight = userPerms.includes(targetPerm); // ✅ เช็คแค่สิทธิ์ที่ระบุ
+      
+      if (hasRight) {
+        console.log(`[FindApprover] ✅ Found User: ${u.username} (${u.email})`);
+      }
+      return hasRight;
+    }
+    
+    return false;
+  });
+
+  // ⭐ กรองเฉพาะ Email ที่ถูกต้อง
+  const emails = approvers
+    .map(u => u.email)
+    .filter(email => email && email.includes('@') && email.trim() !== '');
+  
+  const result = emails.join(',');
+  console.log(`[FindApprover] ===== RESULT =====`);
+  console.log(`[FindApprover] Emails: ${result || '(NONE)'}`);
+  console.log(`[FindApprover] ===== END =====`);
+  
+  return result;
+}
+
+// --- HELPER: สร้าง HTML สำหรับ Budget Tracking แบบกลุ่ม (Group Only) ตาม Logic หน้าเว็บ ---
+function getBudgetInfoForEmail_FullDetail(req) {
+  // 1. กรองเฉพาะ HO / Local เท่านั้น
+  if (!['Local', 'HO'].includes(req.type)) return '';
+
+  // 2. โหลดข้อมูลที่จำเป็น
+  const projects = getSheetData('Projects');
+  const projectData = projects.find(p => p.name === req.job);
+  if (!projectData) return '';
+
+  const allRequests = getSheetData('Requests');
+  const allAssets = getSheetData('Assets');
+
+  // 3. ฟังก์ชันคำนวณยอดเงินรายรายการ (Logic เดียวกับ index.html)
+  const calculateItemTotal = (r, item) => {
+    const isRent = r.type === 'HO' && r.purchaseType === 'Rent';
+    const relatedAssets = allAssets.filter(a => 
+        a.currentRequestId === r.id && 
+        a.name === item.name &&
+        (a.price === item.unitPrice || a.rentalPrice === item.unitPrice)
+    );
+    const receivedLogs = item.receivedLog || [];
+    
+    let itemVal = 0;
+    let cnt = 0;
+
+    if (relatedAssets.length > 0) {
+        itemVal += relatedAssets.reduce((s, asset) => {
+            const price = isRent ? (asset.rentalPrice || 0) : (asset.price || 0);
+            const duration = isRent ? (asset.duration || item.duration || 1) : 1;
+            return s + (price * duration);
+        }, 0);
+        cnt = relatedAssets.length;
+    } else if (receivedLogs.length > 0) {
+        itemVal += receivedLogs.reduce((s, log) => {
+            const duration = isRent ? (log.duration || 1) : 1;
+            return s + (log.qty * log.price * duration);
+        }, 0);
+        cnt = item.receivedTotal || 0;
+    }
+
+    if (r.status !== 'Completed') {
+        const rem = Math.max(0, item.qty - cnt);
+        const dur = isRent ? (item.duration || 1) : 1;
+        itemVal += (rem * (item.unitPrice || 0) * dur);
+    }
+    return itemVal;
+  };
+
+  // 4. จัดกลุ่มข้อมูล (Grouping Logic)
+  const groups = {};
+  req.items.forEach(item => {
+    ['SubJob', 'matCode'].forEach(type => {
+      const code = type === 'SubJob' ? item.subJob : item.matCode;
+      if (!code) return;
+
+      const defs = type === 'SubJob' ? projectData.subJobs : projectData.matCodes;
+      const targetDef = defs?.find(d => d.code === code);
+      const groupName = targetDef?.group || 'Others (อื่นๆ)';
+      const groupKey = `${type}|${groupName}`;
+
+      if (!groups[groupKey]) {
+        groups[groupKey] = { type, name: groupName, codes: new Set(), budget: 0, used: 0, pending: 0, current: 0 };
+      }
+      groups[groupKey].codes.add(code);
+    });
+  });
+
+  // 5. คำนวณยอดสะสมของกลุ่ม
+  Object.keys(groups).forEach(key => {
+    const group = groups[key];
+    const defs = group.type === 'SubJob' ? projectData.subJobs : projectData.matCodes;
+    
+    // รวมงบประมาณทั้งกลุ่ม
+    group.budget = defs.filter(d => d.group === group.name || (!d.group && group.name === 'Others (อื่นๆ)'))
+                        .reduce((sum, d) => sum + (d.budget || 0), 0);
+
+    // วนลูปคำนวณยอดสะสม
+    allRequests.forEach(r => {
+      if (r.job !== req.job || !['Local', 'HO'].includes(r.type)) return;
+      
+      r.items.forEach(item => {
+        const itemCode = group.type === 'SubJob' ? item.subJob : item.matCode;
+        if (group.codes.has(itemCode)) {
+          const val = calculateItemTotal(r, item);
+          if (r.id === req.id) group.current += val;
+          else if (r.status === 'Completed') group.used += val;
+          else if (!['Draft', 'Rejected', 'Returned'].includes(r.status)) group.pending += val;
+        }
+      });
+    });
+  });
+
+  // 6. สร้าง HTML (Progress Bar) ล้อตาม Logic
+  let html = `
+    <div style="margin-top: 20px; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden; font-family: 'Sarabun', sans-serif;">
+      <div style="background-color: #fff8e1; padding: 12px; border-bottom: 1px solid #ffe0b2;">
+        <h3 style="margin: 0; font-size: 14px; color: #f57c00;">ติดตามงบประมาณรายกลุ่ม (Group Budget Tracking)</h3>
+      </div>
+      <div style="padding: 15px; background-color: #ffffff;">
+  `;
+
+  Object.keys(groups).sort().forEach(key => {
+    const g = groups[key];
+    if (g.budget === 0) return;
+
+    const totalUsed = g.used + g.pending + g.current;
+    const isOver = totalUsed > g.budget;
+    const usedPct = Math.min((g.used / g.budget) * 100, 100);
+    const pendingPct = Math.min((g.pending / g.budget) * 100, 100 - usedPct);
+    const currentPct = Math.min((g.current / g.budget) * 100, 100 - usedPct - pendingPct);
+
+    html += `
+      <div style="margin-bottom: 18px;">
+        <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 5px;">
+          <div style="font-weight:bold;">
+            <span style="background:${g.type === 'SubJob' ? '#e8eaf6' : '#f3e5f5'}; color:${g.type === 'SubJob' ? '#3f51b5' : '#7b1fa2'}; padding:2px 5px; border-radius:4px; font-size:10px; margin-right:5px;">${g.type === 'SubJob' ? 'SubJob' : 'Mat. Code'}</span>
+            ${g.name}
+          </div>
+          <div style="font-weight:bold; color:${isOver ? '#d32f2f' : '#333'}">
+            ใช้รวม: ${totalUsed.toLocaleString()} / ${g.budget.toLocaleString()} 
+            ${isOver ? '<span style="color:red; font-size:10px;">(เกินงบ!)</span>' : ''}
+          </div>
+        </div>
+        <div style="height: 10px; width: 100%; background: #f1f1f1; border-radius: 5px; overflow: hidden; display: flex;">
+          <div style="width: ${usedPct}%; background: #4caf50;"></div>
+          <div style="width: ${pendingPct}%; background: #ffc107;"></div>
+          <div style="width: ${currentPct}%; background: #ff9800;"></div>
+        </div>
+        <table style="width: 100%; font-size: 10px; color: #666; margin-top: 4px;">
+          <tr>
+            <td>● ใช้แล้ว (${g.used.toLocaleString()})</td>
+            <td>● รออนุมัติ (${g.pending.toLocaleString()})</td>
+            <td>● ใบนี้ (${g.current.toLocaleString()})</td>
+            <td style="text-align: right; font-weight:bold; color:${(g.budget-totalUsed) < 0 ? '#d32f2f' : '#2e7d32'}">
+              เหลือ: ${(g.budget - totalUsed).toLocaleString()}
+            </td>
+          </tr>
+        </table>
+      </div>
+    `;
+  });
+
+  html += `</div></div>`;
+  return html;
+}
+
+
+function sendApprovalEmail(req, targetEmail, targetRole) {
+  console.log(`[SendEmail] ===== START =====`);
+  if (!targetEmail || targetEmail.trim() === '') {
+    console.error(`[SendEmail] ❌ ERROR: Target email is empty!`);
+    return;
+  }
+
+  // ⭐ โหลดข้อมูลให้ครบ (Requests, Inventory, Assets)
+  const allRequests = getSheetData('Requests'); // โหลดมาเพื่อคำนวณยอดจอง
+  const inventory = getSheetData('Inventory');
+  const assets = getSheetData('Assets');
+  
+  const scriptUrl = ScriptApp.getService().getUrl();
+  const approverName = targetEmail; 
+
+  const approveLink = `${scriptUrl}?action=approve&id=${req.id}&role=${targetRole}&approver=${approverName}`;
+  const rejectLink = `${scriptUrl}?action=reject&id=${req.id}&role=${targetRole}&approver=${approverName}`;
+  
+  let grandTotal = 0;
+  
+  const getRentalUnitTh = (unit) => {
+      if(unit === 'Day') return 'วัน';
+      if(unit === 'Month') return 'เดือน';
+      if(unit === 'Year') return 'ปี';
+      return unit || 'เดือน';
+  };
+
+  const itemsHtml = req.items.map((item, idx) => {
+    const isRent = req.type === 'HO' && req.purchaseType === 'Rent';
+    const duration = isRent ? (item.duration || 1) : 1;
+    const rentalUnitTh = getRentalUnitTh(item.rentalUnit);
+    const total = item.qty * (item.unitPrice || 0) * duration;
+    grandTotal += total;
+
+    // ⭐ เรียกใช้ฟังก์ชันคำนวณสต็อก (พร้อมหักยอดจอง)
+    let stockInfo = getStockInfoHtml(item.name, req.job, req.id, allRequests, inventory, assets);
+    
+    // ⭐ ดึง Note ของสินค้ามาแสดง
+    const itemNote = item.note ? `<div style="font-size:11px; color:#555; font-style:italic; margin-bottom:2px;">** ${item.note}</div>` : '';
+
+    return `
+      <tr style="border-bottom: 1px solid #eee;">
+        <td style="padding: 12px 5px; vertical-align: top; width: 30px;">${idx + 1}</td>
+        <td style="padding: 12px 5px; vertical-align: top;">
+          <div style="font-weight: bold; color: #333; font-size: 14px;">${item.name}</div>
+          <div style="font-size: 12px; color: #666; margin-top: 2px;">
+            ${item.subJob ? `<span style="background:#e3f2fd; color:#1565c0; padding:1px 3px; border-radius:2px;">Sub: ${item.subJob}</span>` : ''} 
+            ${item.MatCode ? `<span style="background:#f3e5f5; color:#7b1fa2; padding:1px 3px; border-radius:2px;">Mat: ${item.MatCode}</span>` : ''}
+          </div>
+          
+          <div style="margin-top: 4px;">
+             ${itemNote}
+             ${stockInfo}
+          </div>
+        </td>
+        <td style="padding: 12px 5px; text-align: right; vertical-align: top; white-space: nowrap;">
+            <div style="font-weight: bold;">${item.qty} ${item.unit}</div>
+            ${isRent ? `<div style="font-size:10px; color:blue;">x ${duration} ${rentalUnitTh}</div>` : ''}
+        </td>
+        <td style="padding: 12px 5px; text-align: right; vertical-align: top; white-space: nowrap;">
+            <div style="font-size: 12px; color:#666;">
+                @${item.unitPrice.toLocaleString()} ${isRent ? '/' + rentalUnitTh : ''}
+            </div>
+            <div style="font-weight: bold; color: #333; font-size: 14px;">${total.toLocaleString()}</div>
+        </td>
+      </tr>
+    `;
+  }).join('');
+
+  // ⭐ เรียก Budget HTML (Full Detail)
+  const budgetHtml = getBudgetInfoForEmail_FullDetail(req);
+
+  const htmlBody = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <style>
+        body { margin: 0; padding: 0; background-color: #f0f2f5; font-family: 'Sarabun', sans-serif; }
+        .container { 
+            max-width: 600px; 
+            margin: 0 auto; 
+            background-color: #ffffff; 
+            border-radius: 8px; 
+            overflow: hidden; 
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1); 
+        }
+        .header { background-color: #1976d2; padding: 25px 20px; color: #ffffff; }
+        .content { padding: 20px; }
+        .btn { 
+            display: inline-block; 
+            padding: 12px 24px; 
+            text-decoration: none; 
+            border-radius: 6px; 
+            font-weight: bold; 
+            font-size: 16px; 
+            text-align: center;
+            margin: 5px;
+        }
+        .btn-approve { background-color: #2e7d32; color: white !important; }
+        .btn-reject { background-color: #d32f2f; color: white !important; }
+        .btn-link { background-color: #fff; color: #1976d2 !important; border: 1px solid #1976d2; font-size: 14px; padding: 10px 20px;}
+        
+        @media only screen and (max-width: 600px) {
+          .btn { display: block; width: 90%; margin: 10px auto; }
+          .meta-table td { display: block; width: 100%; padding-bottom: 5px; }
+          .header h2 { font-size: 20px; }
+        }
+      </style>
+    </head>
+    <body>
+      <div style="padding: 10px;">
+        <div class="container">
+          
+          <div class="header">
+            <h2 style="margin: 0;">คำขออนุมัติ: ${req.id}</h2>
+            <p style="margin: 5px 0 0; opacity: 0.9;">โครงการ: <strong>${req.job}</strong></p>
+            <p style="margin: 2px 0 0; opacity: 0.9; font-size: 14px;">ผู้ขอ: ${req.requester}</p>
+          </div>
+          
+          <div class="content">
+            <table class="meta-table" style="width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 14px; color: #444;">
+              <tr>
+                <td style="padding: 5px; color: #888;">ประเภท:</td>
+                <td style="padding: 5px; font-weight: bold; color: #333;">
+                    ${req.type === 'HO' ? (req.purchaseType === 'Rent' ? 'HO (เช่า)' : 'HO (ซื้อขาด)') : req.type}
+                </td>
+              </tr>
+              <tr>
+                <td style="padding: 5px; color: #888;">วันที่ต้องการ:</td>
+                <td style="padding: 5px; font-weight: bold; color: #333;">${req.dateRequired}</td>
+              </tr>
+              <tr>
+                <td style="padding: 5px; color: #888;">ความสำคัญ:</td>
+                <td style="padding: 5px; font-weight: bold; color: ${req.priority === 'Critical' ? 'red' : 'blue'};">${req.priority}</td>
+              </tr>
+            </table>
+
+            <h3 style="border-bottom: 2px solid #f0f0f0; padding-bottom: 10px; margin-bottom: 0; font-size: 16px; color: #333;">รายการสินค้า</h3>
+            <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+              <thead style="background-color: #f9fafb; color: #666; font-size: 12px;">
+                <tr>
+                  <th style="padding: 8px 5px; text-align: left;">#</th>
+                  <th style="padding: 8px 5px; text-align: left;">รายการ / หมายเหตุ</th>
+                  <th style="padding: 8px 5px; text-align: right;">จำนวน</th>
+                  <th style="padding: 8px 5px; text-align: right;">รวมเงิน</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${itemsHtml}
+              </tbody>
+              <tfoot style="background-color: #f1f8e9;">
+                <tr>
+                  <td colspan="3" style="padding: 10px; text-align: right; font-weight: bold; color: #333;">รวมสุทธิ</td>
+                  <td style="padding: 10px 5px; text-align: right; font-weight: bold; color: #1976d2; font-size: 16px;">${grandTotal.toLocaleString()}</td>
+                </tr>
+              </tfoot>
+            </table>
+            
+            ${req.note ? `
+              <div style="margin-top: 20px; padding: 12px; background-color: #fff8e1; border-radius: 6px; border-left: 4px solid #ffc107; font-size: 14px;">
+                <strong>หมายเหตุเพิ่มเติม:</strong> ${req.note}
+              </div>` : ''}
+
+            ${budgetHtml}
+
+            <div style="margin-top: 30px; text-align: center; border-top: 1px solid #eee; padding-top: 20px;">
+              <p style="margin-bottom: 15px; font-weight: bold; color: #555;">กรุณาเลือกการดำเนินการ:</p>
+              
+              <a href="${approveLink}" class="btn btn-approve">✅ อนุมัติ (Approve)</a>
+              <a href="${rejectLink}" class="btn btn-reject">❌ ไม่อนุมัติ (Reject)</a>
+              
+              <div style="margin-top: 20px;">
+                <a href="${scriptUrl}" target="_blank" class="btn btn-link">เปิดดูในแอป (Open App)</a>
+              </div>
+
+              <p style="font-size: 12px; color: #999; margin-top: 15px;">เมื่อกดปุ่ม ระบบจะบันทึกสถานะทันที</p>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
   try {
+    GmailApp.sendEmail(targetEmail, `[PurchaseHub] ขออนุมัติ: ${req.id} - ${req.job}`, '', {
+      htmlBody: htmlBody
+    });
+    console.log(`[SendEmail] ✅ Email sent successfully to ${targetEmail}`);
+  } catch (error) {
+    console.error(`[SendEmail] ❌ Failed to send email: ${error.toString()}`);
+  }
+
+  console.log(`[SendEmail] ===== END =====`);
+}
+
+function syncRequest(request) {
+  console.log(`[SyncRequest] ===== START =====`);
+  console.log(`[SyncRequest] Request ID: ${request.id}`);
+  console.log(`[SyncRequest] Status: ${request.status}`);
+  console.log(`[SyncRequest] Job: ${request.job}`);
+  
+  // 1. บันทึกข้อมูล (เหมือนเดิม)
+  const result = saveDataToSheet('Requests', request.id, request);
+  
+// 2. ระบบส่งเมลอนุมัติ (Approval Buttons)
+  try {
+      if (request.status === 'Pending Head') {
+          // ⭐⭐ [แก้ไข] เช็คประเภทคำขอ ⭐⭐
+          if (request.type === 'Withdraw' || request.type === 'Borrow') {
+              // กรณีเบิก/ยืม: หาอีเมลทั้ง 2 ระดับ
+              const headEmails = findApproverEmails(request.job, 8); // Level 1
+              const pmEmails = findApproverEmails(request.job, 9);   // Level 2
+              
+              // รวมอีเมลเป็น string เดียวกัน (คั่นด้วย comma)
+              let recipients = [];
+              if (headEmails) recipients.push(headEmails);
+              if (pmEmails) recipients.push(pmEmails);
+              
+              // ถ้ามีคนรับ ให้ส่งครั้งเดียวโดยใช้ Role กลางว่า 'Approver'
+              if (recipients.length > 0) {
+                  const combinedEmails = recipients.join(',');
+                  sendApprovalEmail(request, combinedEmails, 'Approver'); 
+              }
+          } else {
+              // กรณีปกติ (ซื้อ Local/HO): ส่งตามลำดับขั้นเดิม
+              const headEmails = findApproverEmails(request.job, 8);
+              if (headEmails) sendApprovalEmail(request, headEmails, 'Head');
+          }
+      }
+      else if (request.status === 'Pending PM') {
+          const pmEmails = findApproverEmails(request.job, 9);
+          if (pmEmails) sendApprovalEmail(request, pmEmails, 'PM');
+      } 
+  } catch (e) {
+      console.error("❌ [SyncRequest] Approval Email FAILED: " + e.toString());
+  }
+
+  // 3. ระบบแจ้งเตือนสถานะ (Notification) (เหมือนเดิม)
+  try {
+      handleStatusNotification(request);
+  } catch (e) {
+      console.error("❌ [SyncRequest] Notification Email FAILED: " + e.toString());
+  }
+
+  console.log(`[SyncRequest] ===== END =====`);
+  return result;
+}
+
+// --- HELPER FUNCTIONS ---
+
+
+
+
+
+// แก้ไขฟังก์ชัน getSheetData เพื่อรองรับการส่ง Query (Filter)
+function getSheetData(sheetName, customQuery = '') {
+  // 1. กำหนด Parameter พื้นฐาน (ดึงแค่ column payload)
+  let params = '?select=payload';
+  
+  // 2. ถ้ามีการส่ง Query พิเศษมา (เช่น การกรอง) ให้เอามาต่อท้าย
+  if (customQuery) {
+    // เช็คว่า customQuery เริ่มต้นด้วย & หรือไม่ ถ้าไม่ให้เติม
+    if (!customQuery.startsWith('&')) params += '&';
+    params += customQuery;
+  }
+
+  // 3. เรียก Supabase พร้อม Filter ที่ส่งมา
+  // (ฟังก์ชัน callSupabase ของคุณรองรับ params ตัวที่ 4 อยู่แล้ว)
+  const jsonResponse = callSupabase(sheetName.toLowerCase(), 'get', null, params);
+  
+  // 4. แปลงข้อมูล
+  try {
+    const data = JSON.parse(jsonResponse);
+    if (Array.isArray(data)) {
+      return data.map(row => row.payload);
+    } else {
+      return []; 
+    }
+  } catch (e) {
+    console.error("Error parsing data from " + sheetName + ": " + e.toString());
+    return [];
+  }
+}
+
+
+function saveDataToSheet(sheetName, id, dataObj) {
+  // ⭐ แยกร่าง! ดึงสมอง AI (embedding) ออกมาก่อนเซฟลง payload
+  let aiVector = null;
+  if (dataObj && dataObj.embedding) {
+    aiVector = dataObj.embedding;
+    delete dataObj.embedding; // ลบออกจากข้อมูล จะได้ไม่ไปรกใน payload
+  }
+
+  const record = {
+    id: id.toString(),
+    payload: dataObj
+  };
+  
+  // ⭐ เอาสมอง AI ไปหยอดใส่คอลัมน์ embedding แยกต่างหาก
+  if (aiVector) {
+    record.embedding = aiVector;
+  }
+  
+  const table = sheetName.toLowerCase();
+  const url = `${SUPABASE_URL}/rest/v1/${table}`;
+  const options = {
+    method: 'post',
+    headers: {
+      'apikey': SUPABASE_ANON_KEY,        
+      'Authorization': 'Bearer ' + SUPABASE_KEY, // 🔴 เจาะทะลุ RLS
+      'Content-Type': 'application/json',
+      'Prefer': 'resolution=merge-duplicates'
+    },
+    payload: JSON.stringify(record)
+  };
+  
+  UrlFetchApp.fetch(url, options);
+  clearAppCache();
+
+  return true;
+}
+
+
+function deleteDataFromSheet(sheetName, id) {
+  var encodedId = encodeURIComponent(id);
+  callSupabase(sheetName, 'delete', null, `?id=eq.${encodedId}`);
+  
+  // ⭐ เพิ่มบรรทัดนี้: ล้างความจำทุกครั้งที่มีการลบข้อมูล
+  clearAppCache(); 
+}
+// --- FILE UPLOAD FUNCTIONS ---
+
+function uploadFileToDrive(base64Data, fileName) {
+  try {
+    const FOLDER_ID = "1bLG6dp7SJVEMvDudKKZnoCpriUPrJyOU"; 
+    const folder = DriveApp.getFolderById(FOLDER_ID);
     const contentType = base64Data.substring(5, base64Data.indexOf(';'));
     const bytes = Utilities.base64Decode(base64Data.split(',')[1]);
-    const blob = Utilities.newBlob(bytes, contentType, reqId + '_' + fileName);
-    const file = DriveApp.createFile(blob);
+    const blob = Utilities.newBlob(bytes, contentType, fileName);
+    const file = folder.createFile(blob);
     file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-    return file.getUrl();
+    return {
+      name: fileName,
+      url: file.getUrl(),
+      id: file.getId()
+    };
   } catch (e) {
-    return '';
+    return { error: e.toString() };
   }
 }
+
+function getOrCreateSubFolder(parentFolderId, subFolderName) {
+  const parentFolder = DriveApp.getFolderById(parentFolderId);
+  const folders = parentFolder.getFoldersByName(subFolderName);
+  if (folders.hasNext()) {
+    return folders.next();
+  } else {
+    return parentFolder.createFolder(subFolderName);
+  }
+}
+
+function uploadAssetImage(base64Data, fileName) {
+  try {
+    const MAIN_FOLDER_ID = "1bLG6dp7SJVEMvDudKKZnoCpriUPrJyOU"; 
+    const SUB_FOLDER_NAME = "Asset_Images"; 
+    const targetFolder = getOrCreateSubFolder(MAIN_FOLDER_ID, SUB_FOLDER_NAME);
+    const contentType = base64Data.substring(5, base64Data.indexOf(';'));
+    const bytes = Utilities.base64Decode(base64Data.split(',')[1]);
+    const blob = Utilities.newBlob(bytes, contentType, fileName);
+    const file = targetFolder.createFile(blob);
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    return {
+      name: fileName,
+      url: file.getUrl(),
+      id: file.getId()
+    };
+  } catch (e) {
+    return { error: e.toString() };
+  }
+}
+
+// --- SPECIFIC SYNC FUNCTIONS ---
+
+function syncProject(project) {
+  return saveDataToSheet('Projects', project.id, project);
+}
+
+function deleteProjectFromSheet(id) {
+  deleteDataFromSheet('Projects', id);
+}
+
+
+function syncInventory(item) {
+  return saveDataToSheet('Inventory', item.id, item);
+}
+
+function syncAsset(asset) {
+  return saveDataToSheet('Assets', asset.id, asset);
+}
+
+function syncLog(log) {
+  const id = log.date + '_' + Math.floor(Math.random() * 1000); 
+  return saveDataToSheet('Logs', id, log);
+}
+
+// --- USER MANAGEMENT & MAIN API ---
+
+function loginUser(username, password) {
+  if (username === 'admin' && password === '1231') {
+    return {
+      success: true,
+      user: {
+        username: 'admin',
+        firstName: 'System',
+        lastName: 'Administrator',
+        empId: 'ADMIN-001',
+        role: 'Admin (ผู้ดูแลระบบ)',
+        isSuperAdmin: true,
+        status: 'Activated'
+      }
+    };
+  }
+
+  const users = getSheetData('Users');
+  const user = users.find(u => u.username === username && u.password === password);
+  
+  if (user) {
+    if (user.status !== 'Activated') {
+       return { success: false, message: 'บัญชีนี้ถูกระงับการใช้งาน หรือรอการอนุมัติ' };
+    }
+    return { 
+      success: true, 
+      user: {
+        ...user,
+        password: '' 
+      }
+    };
+  } else {
+    return { success: false, message: 'ชื่อผู้ใช้งานหรือรหัสผ่านไม่ถูกต้อง' };
+  }
+}
+
+function registerUser(formData) {
+  const users = getSheetData('Users');
+  if (users.some(u => u.username === formData.username)) {
+    return { success: false, message: 'Username นี้ถูกใช้งานแล้ว' };
+  }
+  
+  const newUser = {
+    id: formData.username, 
+    ...formData,
+    role: 'User', 
+    status: 'New', 
+    permissions: {}, 
+    createdAt: new Date().toLocaleString('th-TH')
+  };
+  
+  saveDataToSheet('Users', newUser.id, newUser);
+  return { success: true, message: 'ลงทะเบียนเรียบร้อย รอแอดมินอนุมัติ' };
+}
+
+// [ค้นหาฟังก์ชัน saveUserData เดิม แล้วแทนที่ด้วยโค้ดนี้]
+
+function saveUserData(user) {
+  const users = getSheetData('Users');
+  
+  // ⭐ ป้องกันรหัสพนักงาน (Emp ID) ซ้ำ
+  // เช็คว่ามีคนอื่นที่ใช้ EmpID นี้ไหม (ที่ไม่ใช่ตัวเอง)
+  const duplicate = users.find(u => u.empId === user.empId && u.id !== user.id);
+  if (duplicate) {
+    return { 
+      success: false, 
+      message: `ไม่สามารถบันทึกได้: รหัสพนักงาน ${user.empId} ซ้ำกับคุณ ${duplicate.firstName} ${duplicate.lastName}` 
+    };
+  }
+
+  // ถ้าไม่ซ้ำ ให้บันทึก
+  saveDataToSheet('Users', user.id, user);
+  return { success: true, message: 'บันทึกข้อมูลเรียบร้อย' };
+}
+
+
+// ⭐ ฟังก์ชันโหลดเฉพาะตอนเปิดเว็บครั้งแรก (เอาแค่ประกาศ) - เร็วทะลุนรก
+function loadLoginData() {
+  try {
+    const settings = getSheetData('Settings');
+    const announcement = settings.find(s => s.id === 'ANNOUNCEMENT') || null;
+    return { announcement: announcement };
+  } catch(e) {
+    return { announcement: null };
+  }
+}
+
+
+// ==========================================
+// ⭐ ระบบ Cache ของ Google (รองรับข้อมูลขนาดใหญ่)
+// ==========================================
+function getCachedData(key) {
+  const cache = CacheService.getScriptCache();
+  const chunks = cache.get(key + '_CHUNKS');
+  if (!chunks) return null;
+  
+  let stringData = '';
+  for (let i = 0; i < parseInt(chunks); i++) {
+    const chunk = cache.get(key + '_' + i);
+    if (!chunk) return null; // ถ้าชิ้นส่วนหาย ให้ถือว่า Cache เสีย
+    stringData += chunk;
+  }
+  return stringData;
+}
+
+function setCachedData(key, stringData, expirationInSeconds) {
+  const cache = CacheService.getScriptCache();
+  const chunkSize = 45000; // ตัดแบ่งก้อนละ 45,000 ตัวอักษร (ป้องกันเกิน Limit 100KB ของ Google)
+  const chunks = Math.ceil(stringData.length / chunkSize);
+  
+  if (chunks > 30) return; // ถ้าข้อมูลใหญ่เกินไป ไม่ต้องจำ
+  
+  cache.put(key + '_CHUNKS', chunks.toString(), expirationInSeconds);
+  for (let i = 0; i < chunks; i++) {
+    cache.put(key + '_' + i, stringData.substring(i * chunkSize, (i + 1) * chunkSize), expirationInSeconds);
+  }
+}
+
+function clearAppCache() {
+  const cache = CacheService.getScriptCache();
+  cache.remove('ALL_APP_DATA_CHUNKS');
+  for(let i=0; i<30; i++) {
+    cache.remove('ALL_APP_DATA_' + i);
+  }
+}
+
+
+// ==========================================
+// ฟังก์ชันสำหรับโหลดข้อมูลเฉพาะหน้า Login (เบาและเร็ว)
+// ==========================================
+function loadLoginData() {
+  try {
+    const settings = getSheetData('Settings');
+    const announcement = settings.find(s => s.id === 'ANNOUNCEMENT') || null;
+
+    return {
+      success: true,
+      users: getSheetData('Users'),
+      projects: getSheetData('Projects'),
+      announcement: announcement
+    };
+  } catch (error) {
+    console.error("loadLoginData Error: " + error.toString());
+    return { success: false, message: error.toString() };
+  }
+}
+
+
+
+// 1. แก้ไขฟังก์ชันส่ง OTP ให้รับ empId มาเช็คด้วย
+function sendRegistrationOTP(email, username, empId) { // ⭐ รับพารามิเตอร์ empId เพิ่ม
+  const users = getSheetData('Users');
+
+  // ตรวจสอบ Username ซ้ำ
+  if (users.some(u => u.username === username)) {
+    return { success: false, message: 'ชื่อผู้ใช้งาน (Username) นี้ถูกใช้งานแล้ว กรุณาเปลี่ยนใหม่' };
+  }
+
+  // ⭐ ตรวจสอบ EmpID ซ้ำ (เพิ่มส่วนนี้)
+  if (users.some(u => u.empId === empId)) {
+    return { success: false, message: 'รหัสพนักงานนี้มีอยู่ในระบบแล้ว' };
+  }
+
+  // ตรวจสอบ Email ซ้ำ
+  if (users.some(u => u.email === email)) {
+    return { success: false, message: 'อีเมลนี้ถูกใช้งานแล้วในระบบ' };
+  }
+
+  // ... (โค้ดสร้าง OTP ส่วนที่เหลือเหมือนเดิม) ...
+  const otp = Math.floor(1000 + Math.random() * 9000).toString();
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let refCode = '';
+  for (let i = 0; i < 4; i++) {
+    refCode += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  
+  CacheService.getScriptCache().put('OTP_' + email, otp, 300);
+
+  try {
+    GmailApp.sendEmail(email, `[PurchaseHub] รหัสยืนยัน (Ref: ${refCode})`, 
+      `รหัสอ้างอิง (Ref Code): ${refCode}\n\nรหัส OTP ของคุณคือ: ${otp}\n\n(รหัสมีอายุ 5 นาที)`);
+    return { success: true, message: 'ส่งรหัส OTP แล้ว', refCode: refCode };
+  } catch (e) {
+    return { success: false, message: 'ส่งอีเมลไม่สำเร็จ: ' + e.toString() };
+  }
+}
+
+// 2. แก้ไขฟังก์ชันบันทึกข้อมูล (เช็คซ้ำอีกรอบก่อนบันทึก)
+function registerUser(formData, otp) {
+  const cachedOtp = CacheService.getScriptCache().get('OTP_' + formData.email);
+  if (!cachedOtp || cachedOtp !== otp) {
+    return { success: false, message: 'รหัส OTP ไม่ถูกต้อง หรือหมดอายุ (กรุณากดรับรหัสใหม่)' };
+  }
+  
+  CacheService.getScriptCache().remove('OTP_' + formData.email);
+
+  const users = getSheetData('Users');
+  
+  // เช็ค Username ซ้ำ
+  if (users.some(u => u.username === formData.username)) {
+    return { success: false, message: 'Username นี้ถูกใช้งานแล้ว' };
+  }
+
+  // ⭐ เช็ค EmpID ซ้ำ (เพิ่มส่วนนี้)
+  if (users.some(u => u.empId === formData.empId)) {
+    return { success: false, message: 'รหัสพนักงานนี้ถูกใช้งานแล้ว' };
+  }
+  
+  const newUser = {
+    id: formData.username, 
+    ...formData,
+    role: 'User', 
+    status: 'New', 
+    permissions: {}, 
+    createdAt: new Date().toLocaleString('th-TH')
+  };
+  saveDataToSheet('Users', newUser.id, newUser);
+  return { success: true, message: 'ลงทะเบียนเรียบร้อย รอแอดมินอนุมัติ' };
+}
+// --- [Server Side] ฟังก์ชันสำหรับระบบลืมรหัสผ่าน ---
+
+// 1. ส่ง OTP เพื่อขอเปลี่ยนรหัสผ่าน
+function sendForgotPasswordOTP(email) {
+  const users = getSheetData('Users');
+  const user = users.find(u => u.email === email);
+  
+  if (!user) {
+    return { success: false, message: 'ไม่พบอีเมลนี้ในระบบ' };
+  }
+
+  // สร้าง OTP และ Ref Code
+  const otp = Math.floor(1000 + Math.random() * 9000).toString();
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let refCode = '';
+  for (let i = 0; i < 4; i++) { refCode += chars.charAt(Math.floor(Math.random() * chars.length)); }
+  
+  // เก็บลง Cache (ใช้ key ต่างจากตอนสมัครสมาชิกเพื่อความปลอดภัย)
+  CacheService.getScriptCache().put('RESET_OTP_' + email, otp, 300); // 5 นาที
+
+  try {
+    GmailApp.sendEmail(email, `[PurchaseHub] รหัสรีเซ็ตรหัสผ่าน (Ref: ${refCode})`, 
+      `รหัสอ้างอิง (Ref Code): ${refCode}\n\nรหัส OTP สำหรับตั้งรหัสผ่านใหม่คือ: ${otp}\n\n(รหัสมีอายุ 5 นาที)`);
+    return { success: true, message: 'ส่งรหัส OTP ไปยังอีเมลแล้ว', refCode: refCode };
+  } catch (e) {
+    return { success: false, message: 'ส่งอีเมลไม่สำเร็จ: ' + e.toString() };
+  }
+}
+
+// 2. ยืนยัน OTP และเปลี่ยนรหัสผ่านทันที
+function resetPassword(email, otp, newPassword) {
+  // ตรวจสอบ OTP
+  const cachedOtp = CacheService.getScriptCache().get('RESET_OTP_' + email);
+  if (!cachedOtp || cachedOtp !== otp) {
+    return { success: false, message: 'รหัส OTP ไม่ถูกต้อง หรือหมดอายุ' };
+  }
+
+  // ค้นหาและอัปเดตข้อมูล User
+  const users = getSheetData('Users');
+  const user = users.find(u => u.email === email);
+  
+  if (user) {
+    user.password = newPassword; // อัปเดตรหัสผ่านใหม่
+    saveDataToSheet('Users', user.id, user); // บันทึกลง Sheet
+    
+    CacheService.getScriptCache().remove('RESET_OTP_' + email); // ลบ OTP ทิ้ง
+    return { success: true, message: 'เปลี่ยนรหัสผ่านสำเร็จ กรุณาเข้าสู่ระบบด้วยรหัสใหม่' };
+  }
+  
+  return { success: false, message: 'เกิดข้อผิดพลาด ไม่พบข้อมูลผู้ใช้' };
+}
+
+// --- เพิ่มฟังก์ชันกู้คืนชื่อผู้ใช้งาน ---
+function sendUsernameToEmail(email) {
+  const users = getSheetData('Users');
+  const user = users.find(u => u.email === email);
+  
+  if (!user) {
+    return { success: false, message: 'ไม่พบอีเมลนี้ในระบบ' };
+  }
+
+  try {
+    GmailApp.sendEmail(email, '[PurchaseHub] กู้คืนชื่อผู้ใช้งาน (Username Recovery)', 
+      `เรียนคุณ ${user.firstName},\n\nชื่อผู้ใช้งาน (Username) ของคุณคือ: ${user.username}\n\nหากคุณไม่ได้ทำรายการนี้ โปรดติดต่อผู้ดูแลระบบ`);
+    return { success: true, message: 'ระบบได้ส่งชื่อผู้ใช้งาน (Username) ไปที่อีเมลของคุณแล้ว' };
+  } catch (e) {
+    return { success: false, message: 'ส่งอีเมลไม่สำเร็จ: ' + e.toString() };
+  }
+}
+
+// --- [เพิ่มฟังก์ชันนี้ที่ท้ายไฟล์ Code.gs] ---
+
+
+
+
+
+// [เพิ่ม/แก้ไข ฟังก์ชันใน Code.gs]
+
+// 1. ฟังก์ชันดึงประกาศ "ทั้งหมด" (สำหรับหน้าจัดการของ Admin)
+function getAllAnnouncements() {
+  const settings = getSheetData('Settings');
+  // กรองเอาเฉพาะ Row ที่ ID ขึ้นต้นด้วย ANN-
+  return settings.filter(s => s.id && s.id.toString().startsWith('ANN-'));
+}
+
+// 2. ฟังก์ชันดึงประกาศ "เฉพาะที่ Active" (สำหรับหน้า Login / Public)
+function getPublicAnnouncements() {
+  const settings = getSheetData('Settings');
+  // กรองเฉพาะ Active = true
+  return settings.filter(s => s.id && s.id.toString().startsWith('ANN-') && s.active === true);
+}
+
+// 3. บันทึกประกาศ (สร้างใหม่ หรือ แก้ไข)
+function saveAnnouncementItem(data) {
+  // ถ้าไม่มี ID ให้สร้างใหม่
+  const id = data.id || `ANN-${new Date().getTime()}`;
+  
+  const payload = {
+    ...data,
+    id: id,
+    updatedBy: data.updatedBy,
+    timestamp: new Date().toLocaleString('th-TH')
+  };
+  
+  saveDataToSheet('Settings', id, payload);
+  return { success: true, message: 'บันทึกประกาศเรียบร้อย', data: payload };
+}
+
+// 4. ลบประกาศ
+function deleteAnnouncementItem(id) {
+  deleteDataFromSheet('Settings', id);
+  return { success: true, message: 'ลบประกาศแล้ว' };
+}
+
+// 5. เปลี่ยนสถานะ (เปิด/ปิด ประกาศ)
+function toggleAnnouncementStatus(id, isActive) {
+  const settings = getSheetData('Settings');
+  const target = settings.find(s => s.id === id);
+  if (target) {
+    target.active = isActive;
+    saveDataToSheet('Settings', id, target);
+    return { success: true, message: isActive ? 'เผยแพร่ประกาศแล้ว' : 'หยุดประกาศแล้ว' };
+  }
+  return { success: false, message: 'ไม่พบข้อมูล' };
+}
+
+// --- เพิ่มต่อท้ายไฟล์ code.gs ---
+
+function uploadUserSignature(base64Data, fileName) {
+  try {
+    const MAIN_FOLDER_ID = "1bLG6dp7SJVEMvDudKKZnoCpriUPrJyOU"; // ใช้ ID โฟลเดอร์หลักเดิม
+    const SUB_FOLDER_NAME = "User_Signatures"; // ชื่อโฟลเดอร์เก็บลายเซ็น
+    const targetFolder = getOrCreateSubFolder(MAIN_FOLDER_ID, SUB_FOLDER_NAME);
+    
+    const contentType = base64Data.substring(5, base64Data.indexOf(';'));
+    const bytes = Utilities.base64Decode(base64Data.split(',')[1]);
+    const blob = Utilities.newBlob(bytes, contentType, fileName);
+    
+    const file = targetFolder.createFile(blob);
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    
+    return {
+      name: fileName,
+      url: file.getUrl(),
+      id: file.getId()
+    };
+  } catch (e) {
+    return { error: e.toString() };
+  }
+}
+
+
+function handleStatusNotification(req) {
+  const status = req.status;
+  
+  // ⭐ ปิดระบบส่งอีเมลสถานะอื่นๆ ทั้งหมด (ยกเว้น Revise Needed)
+ if (status !== 'Revise Needed' && status !== 'Rejected') {
+      return; 
+  }
+
+  if (status === 'Draft') return;
+
+  // 1. หาอีเมลผู้ขอ (เจ้าของ Order)
+  const requesterEmail = findUserEmail(req.requester);
+  
+  // 2. หาอีเมลผู้รับผิดชอบขั้นตอนถัดไป
+  let nextActorEmails = [];
+  if (status !== 'Pending Head' && status !== 'Pending PM') {
+      const permId = getPermissionForStatus(req);
+      if (permId) {
+          const emailsStr = findApproverEmails(req.job, permId);
+          if (emailsStr) nextActorEmails = emailsStr.split(',');
+      }
+  }
+
+  // 3. รวมรายชื่อผู้รับ (ผู้ขอ + ผู้อนุมัติขั้นถัดไป)
+  let recipients = [requesterEmail, ...nextActorEmails]
+      .filter(email => email && email.includes('@'))
+      .map(e => e.trim());
+  recipients = [...new Set(recipients)];
+
+  if (recipients.length === 0) return;
+
+// จัดการชื่อสถานะสำหรับแสดงผล
+  let displayStatus = status;
+  if (status === 'Pending Head') displayStatus = 'Pending Level 1';
+  if (status === 'Pending PM') displayStatus = 'Pending Level 2';
+  if (status === 'Revise Needed') displayStatus = 'ต้องแก้ไขข้อมูล (Revise Needed)';
+
+  // ⭐ [เพิ่มใหม่] ตรวจสอบว่าเป็น Rollback หรือไม่ (เช็คจาก Note ในประวัติล่าสุด)
+  let subjectPrefix = `[อัปเดตสถานะ: ${displayStatus}]`;
+  const lastLog = req.history && req.history.length > 0 ? req.history[req.history.length - 1] : null;
+  
+  // ถ้า Note มีคำว่า Rollback ให้เปลี่ยนหัวข้อเมล
+  if (lastLog && lastLog.note && (lastLog.note.includes('Rollback') || lastLog.note.includes('ย้อนกลับ'))) {
+      subjectPrefix = `[แจ้งเตือน: ย้อนสถานะ (Rollback) กลับเป็น ${displayStatus}]`;
+  } else if (status === 'Revise Needed') {
+      subjectPrefix = `[⚠️ แจ้งเตือน: ส่งเอกสารคืนเพื่อแก้ไข]`; // ⭐ หัวข้ออีเมลตอนส่งกลับให้ดูสำคัญ
+  }
+
+  // 4. สร้างเนื้อหาและส่ง
+  const subject = `${subjectPrefix} ${req.id} - โครงการ ${req.job}`;
+  const body = createNotificationBody(req, displayStatus);
+
+  recipients.forEach(email => {
+      try {
+          GmailApp.sendEmail(email, subject, '', { htmlBody: body });
+          console.log(`[Notification] Sent to ${email}`);
+      } catch (e) {
+          console.error(`[Notification] Error: ${e.toString()}`);
+      }
+  });
+}
+// ฟังก์ชันจับคู่สถานะ -> สิทธิ์ของผู้ที่ต้องทำรายการต่อ
+function getPermissionForStatus(req) {
+  switch (req.status) {
+    case 'Pending Check': return 10; // รอตรวจสอบ -> ฝ่าย Verify (10)
+    case 'Revise Needed': return null; // รอแก้ไข -> ผู้ขอ (ไม่ต้องหาสิทธิ์เพิ่ม)
+    
+    // Approved -> แยกตามประเภท
+    case 'Approved': 
+        if (req.type === 'Local') return 12; // Local -> รอออก PO/สั่งซื้อ (12)
+        if (req.type === 'HO' && req.purchaseType === 'Buy') return 11; // HO Buy -> รอออก PR (11)
+        if (req.type === 'HO' && req.purchaseType === 'Rent') return req.needContract !== false ? 14 : 13; // HO Rent -> สัญญา (14) หรือ ส่งของ (13)
+        return null;
+
+    case 'PR Issued': return 12; // PR ออกแล้ว -> รอออก PO (12)
+    case 'PO Issued': return 13; // PO ออกแล้ว -> รออัปเดตส่งของ (13)
+    case 'Ordered': return 15; // สั่งซื้อแล้ว -> รอรับของ (15)
+    case 'Contract Pending': return 14; // รอสัญญา -> ฝ่ายสัญญา (14)
+    case 'Contract Signed': return 13; // สัญญาแล้ว -> รอส่งของ (13)
+    case 'Shipping': return 15; // กำลังส่ง -> รอรับของ (15)
+    case 'Partially Received': return 15; // รับบางส่วน -> รอรับเพิ่ม (15)
+    case 'Ready to Disburse': return 24; // รอจ่าย -> Store (24)
+    
+    // จบงาน / คืนของ / ไม่ผ่าน -> แจ้งแค่ผู้ขอและผู้เกี่ยวข้องทราบ (ไม่ต้องมี Action ต่อ)
+    case 'Completed': return null; 
+    case 'Returned': return null;
+    case 'Rejected': return null;
+    
+    default: return null;
+  }
+}
+
+// ฟังก์ชันค้นหาอีเมลจากชื่อผู้ใช้งาน (requester string)
+function findUserEmail(requesterStr) {
+  if (!requesterStr) return null;
+  const users = getSheetData('Users');
+  
+  // requesterStr อาจเป็น "First Last" หรือ "ID First Last"
+  // ลองหาแบบ Contains
+  const user = users.find(u => {
+      const fullName = `${u.firstName} ${u.lastName}`;
+      const fullSig = `${u.empId} ${u.firstName} ${u.lastName}`;
+      return requesterStr === fullName || requesterStr === fullSig || requesterStr.includes(u.email);
+  });
+
+  return user ? user.email : null;
+}
+
+function createNotificationBody(req, displayStatus) {
+  // กำหนดสีตามสถานะ
+  let color = '#1976d2'; // ค่าเริ่มต้นสีน้ำเงิน
+  if (req.status === 'Rejected') color = '#d32f2f'; // สีแดง
+  else if (req.status === 'Completed') color = '#2e7d32'; // สีเขียว
+  else if (req.status.includes('Pending')) color = '#f57c00'; // สีส้ม
+  else if (req.status === 'Revise Needed') color = '#e65100'; // ⭐ สีส้มเข้มเตือนสายตา
+
+  // ถ้าไม่ได้ส่ง displayStatus มา ให้คำนวณใหม่
+  if (!displayStatus) {
+      displayStatus = req.status;
+      if (req.status === 'Pending Head') displayStatus = 'Pending Level 1';
+      if (req.status === 'Pending PM') displayStatus = 'Pending Level 2';
+      if (req.status === 'Revise Needed') displayStatus = 'ต้องแก้ไขข้อมูล (Revise Needed)'; // ⭐
+  }
+
+  // ⭐ ดึงประวัติการทำงานล่าสุดเพื่อเอาเหตุผล (Note)
+  const lastLog = req.history && req.history.length > 0 ? req.history[req.history.length - 1] : null;
+  
+  // สร้างกล่องข้อความแจ้งเหตุผล
+  let noteHtml = '';
+  if (lastLog) {
+      // ถ้าเป็นสถานะที่ถูกตีกลับ หรือไม่อนุมัติ จะโชว์กล่องข้อความเตือนชัดเจน
+      if (req.status === 'Revise Needed' || req.status === 'Rejected') {
+          noteHtml = `
+          <div style="margin-top: 15px; padding: 15px; background-color: #fff3e0; border-left: 4px solid ${color}; border-radius: 4px;">
+              <h3 style="margin: 0 0 10px 0; color: ${color}; font-size: 16px;">⚠️ ข้อความจากผู้ตรวจสอบ:</h3>
+              <p style="margin: 0; font-size: 14px; color: #d84315; font-weight: bold; line-height: 1.5;">${lastLog.note || 'ไม่มีระบุเหตุผล'}</p>
+          </div>`;
+      } else {
+          // ถ้าสถานะปกติ โชว์เป็นข้อความอัปเดตธรรมดา
+          noteHtml = `
+          <p style="color: #666; font-size: 12px; margin-top: 15px;">
+              <strong>อัปเดตล่าสุดโดย:</strong> ${lastLog.user}<br/>
+              <strong>บันทึก:</strong> ${lastLog.note || '-'}
+          </p>`;
+      }
+  }
+
+  return `
+    <div style="font-family: 'Sarabun', sans-serif; max-width: 600px; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden;">
+        <div style="background-color: ${color}; color: white; padding: 15px;">
+            <h2 style="margin: 0; font-size: 18px;">${req.status === 'Revise Needed' ? '⚠️ เอกสารต้องแก้ไข (Action Required)' : 'รายการมีการอัปเดตสถานะ'}</h2>
+        </div>
+        <div style="padding: 20px;">
+            <p>เรียน คุณ${req.requester},</p>
+            <p>รายการคำขอหมายเลข <strong>${req.id}</strong> ${req.status === 'Revise Needed' ? 'ถูกส่งกลับมาเพื่อให้ท่านแก้ไขข้อมูล ดังนี้:' : 'มีการเปลี่ยนแปลงสถานะดังนี้:'}</p>
+     
+            <table style="width: 100%; border-collapse: collapse; margin: 15px 0;">
+                <tr style="background-color: #f5f5f5;">
+                    <td style="padding: 10px; border: 1px solid #ddd;"><strong>สถานะปัจจุบัน</strong></td>
+                    <td style="padding: 10px; border: 1px solid #ddd; color: ${color}; font-weight: bold;">${displayStatus}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 10px; border: 1px solid #ddd;"><strong>โครงการ</strong></td>
+                    <td style="padding: 10px; border: 1px solid #ddd;">${req.job}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 10px; border: 1px solid #ddd;"><strong>ผู้ขอ</strong></td>
+                    <td style="padding: 10px; border: 1px solid #ddd;">${req.requester}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 10px; border: 1px solid #ddd;"><strong>รายการสินค้า</strong></td>
+                    <td style="padding: 10px; border: 1px solid #ddd;">${req.items[0]?.name} ${req.items.length > 1 ? `(และอีก ${req.items.length - 1} รายการ)` : ''}</td>
+                </tr>
+            </table>
+
+            ${noteHtml}
+            
+            <div style="text-align: center; margin-top: 25px;">
+                <a href="${ScriptApp.getService().getUrl()}" style="background-color: ${color}; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold; display: inline-block;">เข้าสู่ระบบเพื่อดูรายละเอียด / แก้ไข</a>
+            </div>
+        </div>
+    </div>
+  `;
+}
+
+// --- เพิ่มฟังก์ชันสำหรับสร้างเลข Doc No. ใน Backend (ท้ายไฟล์ code.gs) ---
+
+function getNextDocIndex(allRequests, type, purchaseType) {
+  return allRequests.filter(r => {
+    if (!r.docNumber) return false;
+    if (r.type !== type) return false;
+    if (type === 'HO') return r.purchaseType === purchaseType;
+    return true;
+  }).length;
+}
+
+function generateDocId(type, index, purchaseType) {
+  const now = new Date();
+  const timeZone = "GMT+7";
+  const year = Utilities.formatDate(now, timeZone, "yy");
+  const month = Utilities.formatDate(now, timeZone, "MM");
+  const runNo = (index + 1).toString().padStart(3, '0');
+  
+  switch(type) {
+      case 'Local': return `LPO-${year}${month}-${runNo}`;
+      case 'HO': 
+          return purchaseType === 'Rent' 
+              ? `HRO-${year}${month}-${runNo}` 
+              : `HPO-${year}${month}-${runNo}`;
+      case 'Withdraw': return `WID-${year}${month}-${runNo}`;
+      case 'Borrow': return `BOR-${year}${month}-${runNo}`;
+      default: return `DOC-${year}${month}-${runNo}`;
+  }
+}
+
+
+// --- BUDGET SUMMARY EMAIL TRIGGER ---
+
+/**
+ * ฟังก์ชันสำหรับสร้าง Trigger ให้ส่งเมลทุกวันจันทร์ เวลา 09:00 น.
+ * วิธีใช้: กดเลือกฟังก์ชันนี้แล้วกด Run หนึ่งครั้งเพื่อเริ่มระบบ
+ */
+function setupBudgetSummaryTrigger() {
+  // ลบ Trigger เดิมกันซ้ำ
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'sendWeeklyBudgetSummary') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  
+  // สร้าง Trigger ใหม่: ทุกสัปดาห์ วันจันทร์ เวลา 09:00
+  ScriptApp.newTrigger('sendWeeklyBudgetSummary')
+      .timeBased()
+      .onWeekDay(ScriptApp.WeekDay.MONDAY)
+      .atHour(9)
+      .create();
+      
+  console.log("✅ Budget Summary Trigger setup complete.");
+}
+
+/**
+ * ฟังก์ชันหลักสำหรับส่งเมลสรุปยอด Budget (แสดงเฉพาะยอดใช้จริง ไม่รวมรออนุมัติ)
+ */
+function sendWeeklyBudgetSummary() {
+  console.log("[BudgetSummary] Starting report generation...");
+  
+  const projects = getSheetData('Projects');
+  const requests = getSheetData('Requests');
+  const assets = getSheetData('Assets');
+  const users = getSheetData('Users');
+
+  if (!projects || projects.length === 0) {
+    console.log("[BudgetSummary] No projects found.");
+    return;
+  }
+
+  projects.forEach(proj => {
+    // --- Step A: คำนวณยอดเงิน ---
+    const subJobs = (proj.subJobs || []).map(s => ({ ...s, type: 'SubJob', used: 0, pending: 0 }));
+    const matCodes = (proj.matCodes || []).map(e => ({ ...e, type: 'MatCode', used: 0, pending: 0 }));
+
+    const calculateItemValue = (req, item) => {
+        const isRent = req.type === 'HO' && req.purchaseType === 'Rent';
+        const relatedAssets = assets.filter(a => a.currentRequestId === req.id && a.name === item.name);
+        const receivedLogs = item.receivedLog || [];
+        
+        let val = 0;
+        let cnt = 0;
+
+        if (relatedAssets.length > 0) {
+            val += relatedAssets.reduce((s, asset) => {
+                const price = isRent ? (asset.rentalPrice || 0) : (asset.price || 0);
+                const duration = isRent ? (asset.duration || item.duration || 1) : 1;
+                return s + (price * duration);
+            }, 0);
+            cnt = relatedAssets.length;
+        } else if (receivedLogs.length > 0) {
+            val += receivedLogs.reduce((s, log) => {
+                const duration = isRent ? (log.duration || 1) : 1;
+                return s + (log.qty * log.price * duration);
+            }, 0);
+            cnt = item.receivedTotal || 0;
+        }
+
+        if (req.status !== 'Completed') {
+            const rem = Math.max(0, item.qty - cnt);
+            const dur = isRent ? (item.duration || 1) : 1;
+            val += (rem * (item.unitPrice || 0) * dur);
+        }
+        return val;
+    };
+
+    requests.forEach(req => {
+        if (req.job !== proj.name) return;
+        if (!['Local', 'HO'].includes(req.type)) return;
+        
+        const isCompleted = req.status === 'Completed';
+        const isPending = !['Draft', 'Rejected', 'Returned', 'Completed'].includes(req.status);
+        
+        if (!isCompleted && !isPending) return;
+
+        req.items.forEach(item => {
+            const amount = calculateItemValue(req, item);
+            if (item.subJob) {
+                const target = subJobs.find(s => s.code === item.subJob);
+                if (target) {
+                    isCompleted ? target.used += amount : target.pending += amount;
+                }
+            }
+            if (item.matCode) {
+                const target = matCodes.find(e => e.code === item.matCode);
+                if (target) {
+                    isCompleted ? target.used += amount : target.pending += amount;
+                }
+            }
+        });
+    });
+
+    // --- Step B: จัดกลุ่มข้อมูล ---
+    const groups = {};
+    const processGroup = (list) => {
+        list.forEach(item => {
+            const gName = item.group || 'Others (อื่นๆ)';
+            const key = `${item.type}|${gName}`; 
+            
+            if (!groups[key]) {
+                groups[key] = { 
+                    key: key,
+                    type: item.type,
+                    name: gName, 
+                    budget: 0, 
+                    used: 0, 
+                    pending: 0, 
+                    items: [] 
+                };
+            }
+            groups[key].budget += (item.budget || 0);
+            groups[key].used += item.used;
+            groups[key].pending += item.pending;
+            groups[key].items.push(item);
+        });
+    };
+    
+    processGroup(subJobs);
+    processGroup(matCodes);
+
+    if (Object.keys(groups).length === 0) return;
+
+    // --- Step C: สร้าง HTML ---
+    let htmlContent = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <style>
+          body { font-family: 'Sarabun', sans-serif; background-color: #f3f4f6; padding: 20px; }
+          .container { max-width: 800px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+          .header { background-color: #1e3a8a; padding: 25px; color: white; text-align: center; }
+          .header h1 { margin: 0; font-size: 22px; }
+          .header h2 { margin: 5px 0 0; font-size: 18px; color: #bfdbfe; }
+          
+          .summary-box { background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px; margin-bottom: 25px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+          .summary-header-sub { font-weight: bold; color: #1e40af; border-bottom: 2px solid #bfdbfe; padding-bottom: 8px; margin-bottom: 12px; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+          .summary-header-mat { font-weight: bold; color: #9a3412; border-bottom: 2px solid #fed7aa; padding-bottom: 8px; margin-bottom: 12px; font-size: 16px; display: flex; align-items: center; gap: 8px; margin-top: 20px; }
+          .summary-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; border-bottom: 1px dashed #f1f5f9; padding-bottom: 6px; }
+          
+          .group-section { margin-bottom: 25px; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden; }
+          .group-header { padding: 10px 15px; font-weight: bold; font-size: 15px; display: flex; justify-content: space-between; }
+          
+          .bg-sub { background-color: #eff6ff; color: #1e3a8a; border-left: 5px solid #2563eb; }
+          .bg-mat { background-color: #fff7ed; color: #9a3412; border-left: 5px solid #f97316; }
+
+          .budget-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+          .budget-table th { background-color: #f8fafc; color: #475569; text-align: right; padding: 8px; border-bottom: 1px solid #e2e8f0; }
+          .budget-table th:first-child { text-align: left; }
+          .budget-table td { padding: 8px; border-bottom: 1px solid #f1f5f9; text-align: right; color: #334155; }
+          .budget-table td:first-child { text-align: left; }
+          
+          .num { font-family: 'Courier New', monospace; font-weight: bold; }
+          .text-red { color: #dc2626; }
+          .text-green { color: #16a34a; }
+          .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; margin-right: 5px; }
+          .badge-sub { background: #dbeafe; color: #1e40af; }
+          .badge-mat { background: #ffedd5; color: #9a3412; }
+          .text-sub { color: #1e40af; }
+          .text-mat { color: #c2410c; }
+          .footer { background-color: #f1f5f9; padding: 15px; text-align: center; font-size: 12px; color: #64748b; border-top: 1px solid #e2e8f0; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h1>สรุปงบประมาณรายสัปดาห์</h1>
+            <h2>โครงการ: ${proj.name}</h2>
+            <p style="font-size: 12px; margin-top:5px; opacity: 0.8;">ข้อมูล ณ วันที่ ${new Date().toLocaleString('th-TH')}</p>
+          </div>
+          <div style="padding: 20px;">
+    `;
+
+    // --- ส่วนสรุป (Summary Box) ---
+    htmlContent += `<div class="summary-box">`;
+    const sortedKeys = Object.keys(groups).sort();
+    
+    const renderSummaryRow = (gKey) => {
+        const g = groups[gKey];
+        // ⭐ คำนวณเฉพาะยอดใช้จริง (Used) ไม่รวม Pending
+        const totalUsed = g.used; 
+        const remaining = g.budget - totalUsed;
+        const pct = g.budget > 0 ? (totalUsed / g.budget) * 100 : 0;
+        
+        return `
+            <div class="summary-row">
+                <div style="font-weight:bold; color:#333;">${g.name}</div>
+                <div style="text-align:right;">
+                    <span style="color:#64748b; font-size:12px;">งบ: ${g.budget.toLocaleString()}</span> | 
+                    <span style="color:#2563eb;">ใช้จริง: ${totalUsed.toLocaleString()}</span> | 
+                    <span style="font-weight:bold; color:${remaining < 0 ? '#dc2626' : '#16a34a'};">เหลือ: ${remaining.toLocaleString()}</span>
+                    <span style="font-size:10px; background:#f1f5f9; padding:1px 4px; border-radius:3px; margin-left:5px; border:1px solid #e2e8f0;">${pct.toFixed(1)}%</span>
+                </div>
+            </div>
+        `;
+    };
+
+    const subJobKeys = sortedKeys.filter(k => groups[k].type === 'SubJob');
+    if (subJobKeys.length > 0) {
+        htmlContent += `<div class="summary-header-sub">🏗️ สรุปงานโครงสร้าง (SubJob)</div>`;
+        subJobKeys.forEach(k => htmlContent += renderSummaryRow(k));
+    }
+
+    const matCodeKeys = sortedKeys.filter(k => groups[k].type === 'MatCode');
+    if (matCodeKeys.length > 0) {
+        htmlContent += `<div class="summary-header-mat">🧱 สรุปหมวดวัสดุ (Mat. Code)</div>`;
+        matCodeKeys.forEach(k => htmlContent += renderSummaryRow(k));
+    }
+    htmlContent += `</div>`;
+
+    // --- ส่วนตารางรายละเอียด (Detailed Tables) ---
+    const renderDetailTable = (gKey) => {
+        const g = groups[gKey];
+        const headerClass = g.type === 'SubJob' ? 'bg-sub' : 'bg-mat';
+        
+        let tableHtml = `
+            <div class="group-section">
+                <div class="group-header ${headerClass}">
+                    <span>${g.name}</span>
+                    <span style="font-size:12px; font-weight:normal; opacity:0.8;">งบกลุ่ม: ${g.budget.toLocaleString()}</span>
+                </div>
+                <table class="budget-table">
+                    <thead>
+                        <tr>
+                            <th width="40%">รายการ (Code)</th>
+                            <th width="20%">งบประมาณ</th>
+                            <th width="20%">ใช้จริง</th> <th width="20%">คงเหลือ</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+        `;
+
+        g.items.sort((a,b) => a.code.localeCompare(b.code)).forEach(item => {
+            const budget = item.budget || 0;
+            // ⭐ คำนวณเฉพาะยอดใช้จริง (item.used)
+            const totalUsed = item.used;
+            const remaining = budget - totalUsed;
+            
+            const badgeClass = item.type === 'SubJob' ? 'badge-sub' : 'badge-mat';
+            const textClass = item.type === 'SubJob' ? 'text-sub' : 'text-mat';
+            const label = item.type === 'SubJob' ? 'Sub' : 'Mat';
+
+            tableHtml += `
+                <tr>
+                    <td>
+                        <span class="badge ${badgeClass}">${label}</span>
+                        <strong class="${textClass}">${item.code}</strong><br/>
+                        <span style="color:#94a3b8; font-size:10px;">${item.description || ''}</span>
+                    </td>
+                    <td class="num">${budget.toLocaleString()}</td>
+                    <td class="num">${totalUsed.toLocaleString()}</td>
+                    <td class="num ${remaining < 0 ? 'text-red' : 'text-green'}">${remaining.toLocaleString()}</td>
+                </tr>
+            `;
+        });
+        tableHtml += `</tbody></table></div>`;
+        return tableHtml;
+    };
+
+    subJobKeys.forEach(k => htmlContent += renderDetailTable(k));
+    matCodeKeys.forEach(k => htmlContent += renderDetailTable(k));
+
+    htmlContent += `</div><div class="footer">ระบบ PurchaseHub System | อีเมลอัตโนมัติ</div></div></body></html>`;
+
+    // --- Step D: ส่งเมล ---
+    const targetPerms = [2, 3, 8, 9, 10];
+    const recipientEmails = users.filter(u => {
+        if (u.status !== 'Activated') return false;
+        if (u.isSuperAdmin) return true;
+        if (u.permissions && u.permissions[proj.name]) {
+            return u.permissions[proj.name].some(p => targetPerms.includes(Number(p)));
+        }
+        return false;
+    }).map(u => u.email).filter(e => e && e.includes('@'));
+
+    const uniqueRecipients = [...new Set(recipientEmails)];
+
+    if (uniqueRecipients.length > 0) {
+        try {
+            GmailApp.sendEmail(
+                uniqueRecipients[0], 
+                `[PurchaseHub] สรุปงบประมาณรายสัปดาห์: ${proj.name}`,
+                "อุปกรณ์ของคุณไม่รองรับ HTML", 
+                { htmlBody: htmlContent, bcc: uniqueRecipients.slice(1).join(',') }
+            );
+            console.log(`[BudgetSummary] Sent for ${proj.name}`);
+        } catch (e) { console.error(`Failed to send for ${proj.name}: ${e}`); }
+    }
+  });
+  console.log("[BudgetSummary] Completed.");
+}
+
+// --- ฟังก์ชันสำหรับอัปเดต ID ในประวัติ (Logs) เมื่อมีการเปลี่ยนรหัสสินค้า ---
+function updateLogItemId(oldId, newId) {
+  console.log(`[UpdateLog] Changing ID from ${oldId} to ${newId}`);
+  
+  // 1. ดึงข้อมูล Logs ทั้งหมด (ดึง column id มาด้วยเพื่อใช้อ้างอิงตอนบันทึกทับ)
+  // เรียกใช้ callSupabase ที่มีอยู่แล้วในโค้ด
+  const response = callSupabase('Logs', 'get', null, '?select=id,payload');
+  
+  // ป้องกัน Error กรณีดึงข้อมูลไม่ได้
+  let data;
+  try {
+    data = JSON.parse(response);
+  } catch (e) {
+    console.error("Error parsing logs:", e);
+    return { success: false, message: 'Failed to parse logs' };
+  }
+  
+  if (!Array.isArray(data)) return { success: false, message: 'No logs found or invalid data' };
+
+  let count = 0;
+  
+  // 2. วนลูปหา Log ที่มี assetId ตรงกับ oldId แล้วแก้เป็น newId
+  data.forEach(row => {
+    let log = row.payload;
+    let changed = false;
+    
+    // ตรวจสอบว่า Log นี้เป็นของรายการที่ถูกเปลี่ยนรหัสหรือไม่
+    // (เช็คที่ assetId หรือ itemId ตามที่ระบบบันทึกไว้)
+    if (log.assetId === oldId) {
+      log.assetId = newId;
+      changed = true;
+    }
+    
+    // ถ้ามีการแก้ไข ให้บันทึกกลับลง Database โดยใช้ saveDataToSheet ที่มีอยู่แล้ว
+    if (changed) {
+      saveDataToSheet('Logs', row.id, log);
+      count++;
+    }
+  });
+
+  console.log(`[UpdateLog] Updated ${count} logs.`);
+  return { success: true, count: count };
+}
+
+
+// --- ฟังก์ชันบันทึกข้อมูลนำเข้าวัสดุแบบกลุ่ม (Bulk Upsert + AI) ---
+function batchImportInventory(items, logs) {
+  // 1. บันทึกรายการสินค้า (Inventory)
+  if (items && items.length > 0) {
+    const records = items.map(item => {
+      // ⭐ แยกร่าง AI (embedding) ออกจากข้อมูล JSON
+      let emb = item.embedding || null;
+      if (item.embedding) delete item.embedding;
+      
+      let rec = {
+        id: item.id.toString(),
+        payload: item
+      };
+      // ถ้ามีค่า AI ให้ยัดใส่คอลัมน์ embedding แยกต่างหาก
+      if (emb) rec.embedding = emb; 
+      
+      return rec;
+    });
+    
+    const url = `${SUPABASE_URL}/rest/v1/inventory`;
+    const options = {
+      method: 'post',
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': 'Bearer ' + SUPABASE_KEY, // 🔴 ใช้สิทธิ์พระเจ้าเจาะ RLS
+        'Content-Type': 'application/json',
+        'Prefer': 'resolution=merge-duplicates' // ทับข้อมูลเดิมถ้า ID ซ้ำ
+      },
+      payload: JSON.stringify(records)
+    };
+    
+    try { 
+        UrlFetchApp.fetch(url, options); 
+    } catch(e) { 
+        console.error("❌ Bulk Inv Error:", e); 
+    }
+  }
+  
+  // 2. บันทึก Logs แบบ Bulk ทีเดียวรวดเร็ว
+  if (logs && logs.length > 0) {
+    const logRecords = logs.map(log => {
+      if (!log.date) log.date = new Date().toLocaleString('th-TH');
+      // สร้าง ID แบบสุ่มไม่ให้ซ้ำกันชัวร์ๆ
+      const logId = log.date + '_' + Math.floor(Math.random() * 10000) + '_' + Math.random().toString(36).substr(2, 5);
+      return { id: logId, payload: log };
+    });
+    
+    const logUrl = `${SUPABASE_URL}/rest/v1/logs`;
+    const logOptions = {
+      method: 'post',
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': 'Bearer ' + SUPABASE_KEY,
+        'Content-Type': 'application/json',
+        'Prefer': 'resolution=merge-duplicates'
+      },
+      payload: JSON.stringify(logRecords)
+    };
+    
+    try { 
+        UrlFetchApp.fetch(logUrl, logOptions); 
+    } catch(e) {
+        console.error("❌ Bulk Log Error:", e);
+    }
+  }
+  
+  return { success: true };
+}
+
+
+// --- ฟังก์ชันบันทึกข้อมูลนำเข้าทรัพย์สินแบบกลุ่ม (Bulk Upsert + AI) ---
+function batchImportAssets(assets, logs) {
+  if (assets && assets.length > 0) {
+    const assetRecords = assets.map(asset => {
+      // ⭐ แยกร่าง AI
+      let emb = asset.embedding || null;
+      if (asset.embedding) delete asset.embedding;
+      
+      let rec = {
+        id: asset.id.toString(),
+        payload: asset
+      };
+      if (emb) rec.embedding = emb; // แยกใส่คอลัมน์
+      return rec;
+    });
+
+    const url = `${SUPABASE_URL}/rest/v1/assets`;
+    const options = {
+      method: 'post',
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': 'Bearer ' + SUPABASE_KEY,
+        'Content-Type': 'application/json',
+        'Prefer': 'resolution=merge-duplicates'
+      },
+      payload: JSON.stringify(assetRecords)
+    };
+
+    try {
+      UrlFetchApp.fetch(url, options);
+    } catch (e) {
+      console.error("❌ Bulk Asset Exception: " + e.toString());
+    }
+  }
+
+  if (logs && logs.length > 0) {
+    const logRecords = logs.map(log => {
+      if (!log.date) log.date = new Date().toLocaleString('th-TH');
+      const logId = log.date + '_' + Math.floor(Math.random() * 10000) + '_' + Math.random().toString(36).substr(2, 5);
+      return { id: logId, payload: log };
+    });
+    const logUrl = `${SUPABASE_URL}/rest/v1/logs`;
+    const logOptions = {
+      method: 'post',
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': 'Bearer ' + SUPABASE_KEY,
+        'Content-Type': 'application/json',
+        'Prefer': 'resolution=merge-duplicates'
+      },
+      payload: JSON.stringify(logRecords)
+    };
+    try { UrlFetchApp.fetch(logUrl, logOptions); } catch (e) {}
+  }
+  return { success: true };
+}
+
+
+
+// ⭐ ฟังก์ชันอัปเดตข้อมูลโครงการแบบ Cascade (เปลี่ยนทุกที่ที่เกี่ยวข้อง)
+function updateProjectGlobalData(newProject, oldId, oldName) {
+  console.log(`[UpdateProject] Renaming from ${oldName} (${oldId}) to ${newProject.name} (${newProject.id})`);
+
+  // --- Helper: ฟังก์ชันดึงข้อมูลเฉพาะกิจ (ป้องกัน Error) ---
+  const getTableData = (table) => {
+    const res = callSupabase(table, 'get', null, '?select=id,payload');
+    try {
+      const data = JSON.parse(res);
+      return Array.isArray(data) ? data : [];
+    } catch (e) {
+      return [];
+    }
+  };
+  // ----------------------------------------------------
+
+  // 1. บันทึกข้อมูลโครงการใหม่ (Upsert)
+  saveDataToSheet('Projects', newProject.id, newProject);
+
+  // 2. ถ้ารหัสโครงการ (ID) เปลี่ยน -> ลบตัวเก่าทิ้ง
+  if (oldId && oldId !== newProject.id) {
+    deleteDataFromSheet('Projects', oldId);
+  }
+
+  // 3. ถ้าชื่อโครงการเปลี่ยน -> ไล่อัปเดตตารางอื่นๆ
+  if (oldName && oldName !== newProject.name) {
+     
+     // A. ตาราง Requests (เอกสาร)
+     const requests = getTableData('Requests');
+     requests.forEach(row => {
+        let req = row.payload;
+        if (req.job === oldName) {
+           req.job = newProject.name;
+           saveDataToSheet('Requests', row.id, req);
+        }
+     });
+
+     // B. ตาราง Inventory (สินค้า)
+     const inventory = getTableData('Inventory');
+     inventory.forEach(row => {
+        let inv = row.payload;
+        if (inv.project === oldName) {
+           inv.project = newProject.name;
+           saveDataToSheet('Inventory', row.id, inv);
+        }
+     });
+
+     // C. ตาราง Assets (ทรัพย์สิน)
+     const assets = getTableData('Assets');
+     assets.forEach(row => {
+        let ast = row.payload;
+        if (ast.project === oldName) {
+           ast.project = newProject.name;
+           saveDataToSheet('Assets', row.id, ast);
+        }
+     });
+
+     // D. ตาราง Users (สิทธิ์การใช้งาน)
+     const users = getTableData('Users');
+     users.forEach(row => {
+        let u = row.payload;
+        if (u.permissions && u.permissions[oldName]) {
+           // ย้ายสิทธิ์ไปชื่อใหม่
+           u.permissions[newProject.name] = u.permissions[oldName];
+           // ลบสิทธิ์ชื่อเก่า
+           delete u.permissions[oldName];
+           saveDataToSheet('Users', row.id, u);
+        }
+     });
+  }
+  
+  return { success: true, message: 'อัปเดตข้อมูลโครงการเรียบร้อย (มีผลทั้งระบบ)' };
+}
+
+
+// --- [Code.gs] ระบบจัดการสถานะแบบปลอดภัย (Prevent Duplicate Doc No) ---
+
+/**
+ * ฟังก์ชันอัปเดตสถานะและสร้างเลขที่เอกสารแบบเข้าคิว (Lock)
+ * ใช้แทนการ saveRequestToSheet แบบเดิมเมื่อมีการเปลี่ยนสถานะ
+ */
+
+// ... existing code ...
+function updateStatusSecurely(id, newStatus, logObj, extraUpdates = {}) {
+  // 1. เริ่มระบบล็อก (รอคิวได้นานสุด 15 วินาที)
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000); 
+  } catch (e) {
+    return { success: false, message: 'ระบบกำลังทำงานหนัก กรุณาลองใหม่อีกครั้ง (Server Busy)' };
+  }
+
+  try {
+    // 2. ดึงข้อมูลล่าสุดจาก Database
+    var requests = getSheetData('Requests');
+    var index = requests.findIndex(function(r) { return r.id === id; });
+    if (index === -1) return { success: false, message: 'ไม่พบข้อมูลเอกสารนี้ในระบบ' };
+    
+    var req = requests[index];
+
+    // 3. อัปเดตข้อมูล (สถานะ)
+    req.status = newStatus;
+
+    // ⭐ [แก้ไข] สร้างตัวแปรเก็บสถานะไว้ก่อน (Flag) ว่าต้องการสร้างเลขใหม่หรือไม่
+    var shouldGenNewDoc = false;
+
+    if (extraUpdates) {
+      // ถ้ามีการส่ง docNumber: null มา 
+      if (extraUpdates.hasOwnProperty('docNumber') && extraUpdates.docNumber === null) {
+          req.docNumber = null; // ล้างเลขเดิม
+          shouldGenNewDoc = true; // ✅ จำสถานะไว้ว่าต้องสร้างใหม่
+          
+          delete extraUpdates.docNumber; // ลบออกจาก object เพื่อไม่ให้ loop เอาค่า null มาทับ
+      }
+
+      // อัปเดตค่าอื่นๆ ตามปกติ (เช่น type: 'HO')
+      Object.keys(extraUpdates).forEach(function(key) {
+        req[key] = extraUpdates[key];
+      });
+    }
+
+    // 4. บันทึกประวัติ (History)
+    if (!req.history) req.history = [];
+    if (!logObj.date) logObj.date = new Date().toLocaleString('th-TH');
+    req.history.push(logObj);
+
+    // 5. Generate Doc ID Logic
+    if (!req.docNumber) {
+        var isBuyReady = ['Local', 'HO'].includes(req.type) && 
+            ['Approved', 'Revise Needed', 'Ordered', 'PR Issued', 'PO Issued', 'Contract Pending', 'Contract Signed', 'Shipping', 'Completed'].includes(newStatus);
+        
+        var isUseReady = ['Withdraw', 'Borrow'].includes(req.type) && 
+            ['Ready to Disburse', 'Completed', 'Returned'].includes(newStatus);
+        
+        // ⭐ [แก้ไข] ใช้ตัวแปร shouldGenNewDoc ที่เราเก็บไว้ตอนแรก แทนการเช็คจาก extraUpdates ซ้ำ
+        var isForceGen = shouldGenNewDoc;
+
+        if (isBuyReady || isUseReady || isForceGen) {
+            // นับเลขล่าสุดจากฐานข้อมูลโดยตรง
+            var count = getNextDocIndex(requests, req.type, req.purchaseType);
+            var newDocId = generateDocId(req.type, count, req.purchaseType);
+            
+            req.docNumber = newDocId; 
+            
+            // อัปเดต Log ให้รู้ว่าเปลี่ยนเลขแล้ว
+            if (req.history.length > 0) {
+                req.history[req.history.length - 1].note += ' (New Doc No: ' + newDocId + ')';
+            }
+        }
+    }
+
+    // 6. บันทึกข้อมูลลง Supabase
+    saveDataToSheet('Requests', req.id, req);
+
+ // 7. จัดการส่งอีเมล (แยก Logic มาจาก syncRequest เดิม)
+    /* 🔴 [STOPPED] หยุดการส่งเมลแจ้งเตือนทั่วไป 
+       (เพื่อให้การกดเปลี่ยนสถานะหน้าเว็บเร็วขึ้น หรือป้องกันเมลรบกวน) ... */
+       
+// ⭐ [ปลดล็อก] ยอมให้ส่งอีเมล "เฉพาะ" กรณีที่ตีกลับให้แก้ไข หรือไม่อนุมัติ (เพื่อให้ผู้ขอรู้ตัวทันที)
+    if (newStatus === 'Revise Needed' || newStatus === 'Rejected') {
+        try {
+            handleStatusNotification(req);
+        } catch (err) {
+            console.error("Email Error: " + err);
+        }
+    }
+
+    // ⭐⭐⭐ เพิ่มโค้ดดักส่ง LINE ตรงนี้ ⭐⭐⭐
+    try {
+        sendLineGroupNotification(req);
+    } catch (err) {
+        console.error("LINE Error: " + err);
+    }
+
+    return { success: true, request: req };
+} catch (e) {
+    return { success: false, message: 'Error: ' + e.toString() };
+  } finally {
+    // 8. ปลดล็อกเสมอ เพื่อให้คนอื่นใช้งานต่อได้
+    lock.releaseLock();
+  }
+}
+
+
+function triggerEmails(request) {
+  // ⭐ เพิ่มบรรทัดนี้ เพื่อส่งแจ้งเตือนเข้ากลุ่ม LINE
+  sendLineGroupNotification(request);
+
+  if (request.status === 'Pending Head') {
+      if (request.type === 'Withdraw' || request.type === 'Borrow') {
+          var headEmails = findApproverEmails(request.job, 8);
+          var pmEmails = findApproverEmails(request.job, 9);
+          var recipients = [];
+          if (headEmails) recipients.push(headEmails);
+          if (pmEmails) recipients.push(pmEmails);
+          if (recipients.length > 0) {
+              sendApprovalEmail(request, recipients.join(','), 'Approver');
+          }
+      } else {
+          var headEmails = findApproverEmails(request.job, 8);
+          if (headEmails) sendApprovalEmail(request, headEmails, 'Head');
+      }
+  }
+  else if (request.status === 'Pending PM') {
+      var pmEmails = findApproverEmails(request.job, 9);
+      if (pmEmails) sendApprovalEmail(request, pmEmails, 'PM');
+  } 
+}
+
+
+function processStockAudit(adjustments, userBy) {
+  // adjustments = Array ของ { id, name, oldQty, newQty, reason, project }
+  
+  if (!adjustments || adjustments.length === 0) return { success: true, message: 'ไม่มีรายการที่ต้องปรับปรุง' };
+
+  // 1. เตรียมข้อมูลสำหรับ Bulk Upsert Inventory
+  // เราจะอัปเดตเฉพาะรายการที่มีผลต่าง (Diff)
+  const inventoryUpdates = adjustments.map(item => {
+    // ต้องโหลดข้อมูลเดิมมา merge หรือส่งไปเฉพาะ field ที่เปลี่ยน (แต่ Supabase upsert ปกติต้องส่งทั้งก้อนถ้าไม่มี patch)
+    // เพื่อความง่ายและปลอดภัย ให้ส่งข้อมูลใหม่ไปทับเลย โดยใช้ ID เดิม
+    return {
+      id: item.id,
+      // ระวัง: ตรงนี้ต้องแน่ใจว่า item ที่ส่งมามี field ครบถ้วนจากหน้าบ้าน
+      // หรือถ้าจะให้ดี หน้าบ้านควรส่ง object inventory ตัวเต็มที่แก้ qty แล้วมา
+      payload: item.fullObject 
+    };
+  });
+
+  // 2. เตรียม Logs
+  const logRecords = adjustments.map(item => {
+    const diff = item.newQty - item.oldQty;
+    const sign = diff > 0 ? '+' : '';
+    
+    return {
+      id: `LOG-AUDIT-${new Date().getTime()}-${Math.floor(Math.random()*1000)}`,
+      payload: {
+        date: new Date().toLocaleString('th-TH'),
+        action: 'Audit Adjust', // Action พิเศษ
+        item: item.name,
+        change: `${sign}${diff}`, // แสดงผลต่าง เช่น -5 หรือ +2
+        note: `ตรวจนับประจำเดือน: ${item.reason}`,
+        by: userBy,
+        project: item.project,
+        assetId: item.id // ลิงก์กับสินค้า
+      }
+    };
+  });
+
+  // 3. บันทึกลง Supabase (ใช้ Logic เดียวกับ Batch Import)
+  // 3.1 Update Inventory
+  const urlInv = `${SUPABASE_URL}/rest/v1/inventory`;
+  const optInv = {
+    method: 'post',
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': 'Bearer ' + SUPABASE_KEY,
+      'Content-Type': 'application/json',
+      'Prefer': 'resolution=merge-duplicates'
+    },
+    payload: JSON.stringify(inventoryUpdates)
+  };
+  
+  // 3.2 Insert Logs
+  const urlLog = `${SUPABASE_URL}/rest/v1/logs`;
+  const optLog = {
+    method: 'post',
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': 'Bearer ' + SUPABASE_KEY,
+      'Content-Type': 'application/json',
+      'Prefer': 'resolution=merge-duplicates'
+    },
+    payload: JSON.stringify(logRecords)
+  };
+
+  try {
+    UrlFetchApp.fetch(urlInv, optInv);
+    UrlFetchApp.fetch(urlLog, optLog);
+    return { success: true, count: adjustments.length };
+  } catch (e) {
+    return { success: false, message: e.toString() };
+  }
+}
+
+
+// --- [Code.gs] SERVER-SIDE PERMISSION CHECK ---
+
+// 1. ฟังก์ชันตรวจสอบสิทธิ์ (เลียนแบบ Logic หน้าบ้าน แต่ทำงานที่หลังบ้าน)
+function validateServerPermission(userId, requiredPermId, targetProject) {
+  // A. ดึงข้อมูล User ล่าสุดจาก Supabase
+  const users = getSheetData('Users');
+  const user = users.find(u => u.id === userId || u.username === userId);
+
+  if (!user) throw new Error("⛔ Access Denied: User not found.");
+  if (user.status !== 'Activated') throw new Error("⛔ Access Denied: Account inactive.");
+  
+  // B. ถ้าเป็น Super Admin ให้ผ่านเลย
+  if (user.isSuperAdmin) return true;
+
+  // C. เตรียมข้อมูลสิทธิ์
+  // ถ้า targetProject เป็น null หรือ 'All' ให้ถือว่าต้องมีสิทธิ์ใน "อย่างน้อย 1 โครงการ" หรือเป็น Global Check
+  // แต่เพื่อความปลอดภัยสูงสุด ควรระบุ Project เสมอถ้าทำได้
+  
+  // กรณี 1: ไม่ระบุโครงการ (Global Action) -> เช็คว่ามีสิทธิ์นี้ใน Project ใด Project หนึ่งไหม
+  if (!targetProject || targetProject === 'All') {
+      const hasPerm = Object.values(user.permissions || {}).some(perms => 
+          perms.includes(2) || perms.includes(requiredPermId)
+      );
+      if (hasPerm) return true;
+  } 
+  // กรณี 2: ระบุโครงการชัดเจน
+  else {
+      const userPerms = user.permissions?.[targetProject] || [];
+      
+      // - เป็น Admin ของโปรเจกต์นี้ (2)
+      if (userPerms.includes(2)) return true;
+
+      // - เป็น Sub-Admin (3) -> ได้สิทธิ์พื้นฐาน (4,5,6,7)
+      if (userPerms.includes(3) && [4, 5, 6, 7].includes(requiredPermId)) return true;
+
+      // - มีสิทธิ์ระบุเฉพาะเจาะจง
+      if (userPerms.includes(requiredPermId)) return true;
+  }
+
+  // ถ้าหลุดทุกเงื่อนไข -> ไม่อนุญาต
+  throw new Error(`⛔ Permission Denied: คุณไม่มีสิทธิ์ทำรายการนี้ (${requiredPermId}) ในโครงการ ${targetProject || 'Any'}`);
+}
+
+// 2. สร้างฟังก์ชันลบแบบปลอดภัย (Secure Delete)
+// ใช้แทน deleteDataFromSheet เดิมที่หน้าบ้านเรียก
+function deleteItemSecure(userId, tableName, id, project) {
+  // แปลง Table Name เป็น Permission ID ที่ต้องใช้
+  let requiredPerm = 0;
+  if (tableName === 'Inventory') requiredPerm = 18; // สิทธิ์ลบสินค้า
+  else if (tableName === 'Assets') requiredPerm = 21; // สิทธิ์ลบทรัพย์สิน
+  else if (tableName === 'Projects') requiredPerm = 26; // สิทธิ์จัดการโครงการ
+
+  if (requiredPerm === 0) throw new Error("Unknown table type");
+
+  // ⭐ ตรวจสอบสิทธิ์ก่อนลบ
+  validateServerPermission(userId, requiredPerm, project);
+
+  // ถ้าผ่าน -> เรียกฟังก์ชันลบของเดิม
+  deleteDataFromSheet(tableName, id);
+  return { success: true };
+}
+
+
+function checkMailQuota() {
+  var remaining = MailApp.getRemainingDailyQuota();
+  Logger.log("คุณสามารถส่งเมลได้อีก: " + remaining + " ฉบับในวันนี้");
+}
+
+
+function createRequestSecurely(reqData) {
+  var lock = LockService.getScriptLock();
+  try {
+    // 1. เริ่มล็อกระบบ (รอคิวได้นานสุด 30 วินาที)
+    lock.waitLock(30000); 
+    
+    // 2. ดึงข้อมูล Requests ล่าสุดจาก Database (Refresh ข้อมูลจริง)
+    var allRequests = getSheetData('Requests');
+
+    // =========================================================
+    // 🟢 2.5 [เพิ่มใหม่] เช็คสต็อก/สถานะจอง ก่อนทำต่อ
+    // ส่ง allRequests ไปด้วยเพื่อช่วยเช็คว่ามีใครจองค้างอยู่ไหม
+    var errorMsg = checkAvailability(reqData, allRequests);
+    
+    if (errorMsg) {
+       // ถ้าไม่ว่าง/ไม่พอ ให้หยุดและส่งค่า false กลับไปทันที
+       return { success: false, message: errorMsg };
+    }
+    // =========================================================
+    
+    // 3. คำนวณหา ID ถัดไป (REQ-xxx)
+    var existingIds = allRequests
+        .map(function(r) { return r.id; })
+        .filter(function(id) { return id && typeof id === 'string' && id.startsWith('REQ-'); });
+
+    var maxNum = 0;
+    if (existingIds.length > 0) {
+        maxNum = existingIds.reduce(function(max, id) {
+            var numPart = parseInt(id.replace(/^REQ-/, ''), 10);
+            return !isNaN(numPart) && numPart > max ? numPart : max;
+        }, 0);
+    }
+    
+    var nextId = 'REQ-' + String(maxNum + 1).padStart(3, '0');
+    
+    // 4. กำหนด ID ใหม่ให้กับข้อมูล
+    reqData.id = nextId;
+    
+    // 5. บันทึกลง Database
+    saveDataToSheet('Requests', nextId, reqData);
+    
+    // 6. ส่งอีเมลแจ้งเตือน
+    if (reqData.status !== 'Draft') {
+        try {
+            triggerEmails(reqData);        
+            handleStatusNotification(reqData); 
+        } catch (emailErr) {
+            console.error("Email Error: " + emailErr);
+        }
+    }
+    
+    return { success: true, request: reqData };
+    
+  } catch (e) {
+    return { success: false, message: 'บันทึกไม่สำเร็จ: ' + e.toString() };
+  } finally {
+    // 7. ปลดล็อกเสมอ
+    lock.releaseLock();
+  }
+}
+
+function checkAvailability(newReq, allRequests) {
+  var inventory = getSheetData('Inventory'); 
+  var assets = getSheetData('Assets');
+
+  for (var i = 0; i < newReq.items.length; i++) {
+    var item = newReq.items[i];
+
+    // --- กรณี 1: เบิกวัสดุ (Withdraw) ---
+    if (newReq.type === 'Withdraw') {
+      // ดึงประเภทที่เลือกว่าเป็น System หรือ NonSystem (ถ้าไม่มีให้ถือเป็น System)
+      var itemStockType = item.stockType || newReq.withdrawStockType || 'System';
+
+      // 1. หาของใน Inventory ตาม Project และ StockType ที่เลือก
+      var stockItem = inventory.find(function(inv) { 
+        return inv.name === item.name && 
+               inv.project === newReq.job && 
+               (inv.stockType || 'System') === itemStockType;
+      });
+
+      if (!stockItem) return 'ไม่พบสินค้า "' + item.name + '" ประเภท "' + (itemStockType === 'System' ? 'ในระบบ' : 'นอกระบบ') + '" ในคลังสินค้า';
+
+      // 2. คำนวณยอดจองรออนุมัติ (แยกตาม Type เดียวกัน)
+      var pendingQty = allRequests.filter(function(r) {
+        return r.type === 'Withdraw' && 
+               r.job === newReq.job &&
+               r.status !== 'Completed' && 
+               r.status !== 'Rejected' && 
+               r.status !== 'Draft' &&
+               r.status !== 'Cancelled' &&
+               r.id !== newReq.id;
+      }).reduce(function(sum, r) {
+        var matchItem = r.items ? r.items.find(function(it) { 
+            var itType = it.stockType || r.withdrawStockType || 'System';
+            return it.name === item.name && itType === itemStockType; 
+        }) : null;
+        return sum + (matchItem ? Number(matchItem.qty) : 0);
+      }, 0);
+
+      // 3. เช็คยอดคงเหลือจริง
+      var currentStock = Number(stockItem.qty || 0); 
+      var realAvailable = currentStock - pendingQty;
+
+      if (Number(item.qty) > realAvailable) {
+        return 'สินค้า "' + item.name + '" มีไม่พอ (คงเหลือว่าง: ' + realAvailable + ', ยอดจอง: ' + pendingQty + ')';
+      }
+    }
+
+    // --- กรณี 2: ยืมทรัพย์สิน (Borrow) ---
+    else if (newReq.type === 'Borrow') {
+      if (item.assetId) { 
+        var assetObj = assets.find(function(a) { return a.id === item.assetId; }); 
+        
+        if (!assetObj) return 'ไม่พบรหัสทรัพย์สิน ' + item.assetId;
+        if (assetObj.status !== 'Available') return 'ทรัพย์สิน "' + item.name + '" ไม่ว่าง (สถานะ: ' + assetObj.status + ')';
+
+        var isBookedByOther = allRequests.some(function(r) {
+           return r.type === 'Borrow' &&
+                  !['Completed', 'Rejected', 'Returned', 'Cancelled', 'Draft'].includes(r.status) &&
+                  r.id !== newReq.id &&
+                  r.items && r.items.some(function(it) { return it.assetId === item.assetId; });
+        });
+
+        if (isBookedByOther) return 'ทรัพย์สิน "' + item.name + '" กำลังติดการจองโดยผู้อื่นอยู่';
+      }
+    }
+  }
+
+  return null; 
+}
+
+function forceAuth() {
+  // เรียกใช้คำสั่งเพื่อให้ระบบตรวจสอบสิทธิ์ (ไม่ต้องทำอะไรจริง)
+  DriveApp.getRootFolder(); 
+  MailApp.getRemainingDailyQuota();
+  console.log("Authorization Complete!");
+}
+
+// --- DAILY SUMMARY TRIGGER ---
+
+// ฟังก์ชันสร้าง Trigger (กด Run ครั้งเดียวเพื่อเปิดใช้งาน)
+function setupDailySummaryTrigger() {
+  // ลบ Trigger เดิมกันซ้ำ
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'sendDailyPendingSummary') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  
+  // ตั้งเวลา: ทุกวัน เวลา 08:00 น.
+  ScriptApp.newTrigger('sendDailyPendingSummary')
+      .timeBased()
+      .everyDays(1)
+      .atHour(8)
+      .create();
+  console.log("✅ Daily Summary Trigger setup complete (08:00 AM daily).");
+}
+
+function sendDailyPendingSummary() {
+  console.log("[DailySummary] Starting...");
+  
+  // ⭐ โหลดข้อมูลทั้งหมดมารอไว้ครั้งเดียว (Performance Optimization)
+  const requests = getSheetData('Requests');
+  const users = getSheetData('Users');
+  const inventory = getSheetData('Inventory'); // เพิ่ม
+  const assets = getSheetData('Assets');       // เพิ่ม
+  
+  const approvers = users.filter(u => 
+    u.status === 'Activated' && u.email && u.email.includes('@') &&
+    (u.permissions && Object.values(u.permissions).some(p => p.includes(8) || p.includes(9)))
+  );
+
+  if (approvers.length === 0) return;
+
+  approvers.forEach(user => {
+    let pendingList = [];
+    const activeReqs = requests.filter(r => r.status === 'Pending Head' || r.status === 'Pending PM');
+
+    activeReqs.forEach(req => {
+      // เช็คสิทธิ์ว่า User คนนี้ อนุมัติใบนี้ได้ไหม
+      let canApprove = false;
+      let roleForAction = '';
+
+      // เช็ค Project Permission ของ User นี้
+      const userPerms = user.permissions?.[req.job] || [];
+      
+      // ⭐ แก้ไข: ตัด userPerms.includes(2) ออกจากการตรวจสอบสิทธิ์ L1/L2
+      const isL1 = userPerms.includes(8); 
+      const isL2 = userPerms.includes(9); 
+
+      // Logic การอนุมัติ (ล้อตามหน้าเว็บ)
+      if (req.status === 'Pending Head') {
+          // เบิก/ยืม: ได้ทั้ง L1 และ L2
+          if ((req.type === 'Withdraw' || req.type === 'Borrow') && (isL1 || isL2)) {
+              canApprove = true;
+              roleForAction = 'Approver'; // Role กลาง
+          } 
+          // ซื้อ: เฉพาะ L1
+          else if (['Local', 'HO'].includes(req.type) && isL1) {
+              canApprove = true;
+              roleForAction = 'Head';
+          }
+      } 
+      else if (req.status === 'Pending PM') {
+          // Level 2 (PM) เท่านั้น
+          if (isL2) {
+              canApprove = true;
+              roleForAction = 'PM';
+          }
+      }
+
+      if (canApprove) {
+        pendingList.push({ ...req, roleForAction });
+      }
+    });
+
+if (pendingList.length > 0) {
+      try {
+        // ⭐ ส่ง requests, inventory, assets ไปด้วย
+        sendSummaryEmailToUser(user, pendingList, requests, inventory, assets);
+        console.log(`[DailySummary] Sent to ${user.email} (${pendingList.length} items)`);
+      } catch (e) {
+        console.error(`[DailySummary] Failed to send to ${user.email}: ${e}`);
+      }
+    }
+  });
+  console.log("[DailySummary] Finished.");
+}
+
+function sendSummaryEmailToUser(user, items, allRequests, allInventory, allAssets) {
+  
+  const scriptUrl = PropertiesService.getScriptProperties().getProperty('WEB_APP_URL');
+
+  const approverEmail = user.email;
+  const allIds = items.map(i => i.id).join(',');
+  
+  const bulkApproveLink = `${scriptUrl}?action=bulk_approve&ids=${allIds}&approver=${approverEmail}&role=Batch`;
+  const bulkRejectLink = `${scriptUrl}?action=bulk_reject&ids=${allIds}&approver=${approverEmail}&role=Batch`;
+
+  let tableRows = '';
+  
+  const getRentalUnitTh = (unit) => {
+      if(unit === 'Day') return 'วัน';
+      if(unit === 'Month') return 'เดือน';
+      if(unit === 'Year') return 'ปี';
+      return unit || 'เดือน';
+  };
+  
+  items.forEach((req, idx) => {
+    const approveLink = `${scriptUrl}?action=approve&id=${req.id}&role=${req.roleForAction}&approver=${approverEmail}`;
+    const rejectLink = `${scriptUrl}?action=reject&id=${req.id}&role=${req.roleForAction}&approver=${approverEmail}`;
+    
+    let itemsDetailHtml = `
+      <table style="width: 100%; border-collapse: collapse; font-size: 12px; background-color: #ffffff; border: 1px solid #eee; margin-top: 5px;">
+        <tr style="background-color: #f9f9f9; color: #666; border-bottom: 1px solid #eee;">
+          <th style="padding: 4px; text-align: left;">รายการ / หมายเหตุ</th>
+          <th style="padding: 4px; text-align: center; width: 50px;">จำนวน</th>
+          <th style="padding: 4px; text-align: right; width: 70px;">ราคา/หน่วย</th>
+          <th style="padding: 4px; text-align: right; width: 70px;">รวม</th>
+        </tr>
+    `;
+
+    let reqGrandTotal = 0;
+
+    req.items.forEach(item => {
+        const isRent = req.type === 'HO' && req.purchaseType === 'Rent';
+        const duration = isRent ? (item.duration || 1) : 1;
+        const lineTotal = (item.qty || 0) * (item.unitPrice || 0) * duration;
+        reqGrandTotal += lineTotal;
+        const rentalUnitTh = getRentalUnitTh(item.rentalUnit);
+
+        // ⭐ คำนวณสต็อกคงเหลือ (หักยอดจอง)
+        let stockInfo = getStockInfoHtml(item.name, req.job, req.id, allRequests, allInventory, allAssets);
+        
+        // ⭐ แสดง Note
+        const itemNote = item.note ? `<div style="color:#555; font-style:italic; margin-bottom:2px;">** ${item.note}</div>` : '';
+
+        itemsDetailHtml += `
+          <tr style="border-bottom: 1px dashed #eee;">
+            <td style="padding: 6px 4px; color: #333;">
+               <div style="font-weight:bold;">${item.name}</div>
+               <div style="font-size:10px; margin-top:2px;">
+                   ${item.subJob ? `<span style="color:#1565c0; background:#e3f2fd; padding:1px 3px; border-radius:2px; margin-right:2px;">Sub: ${item.subJob}</span>` : ''}
+                   ${item.matCode ? `<span style="color:#7b1fa2; background:#f3e5f5; padding:1px 3px; border-radius:2px;">Mat: ${item.matCode}</span>` : ''}
+               </div>
+               <div style="font-size:10px; margin-top:3px;">
+                   ${itemNote}
+                   ${stockInfo}
+               </div>
+            </td>
+            <td style="padding: 6px 4px; text-align: center; white-space: nowrap; vertical-align: top;">
+                ${item.qty} ${item.unit}
+                ${isRent ? `<div style="font-size:10px; color:blue;">x ${duration} ${rentalUnitTh}</div>` : ''}
+            </td>
+            <td style="padding: 6px 4px; text-align: right; vertical-align: top;">
+                ${(item.unitPrice || 0).toLocaleString()} ${isRent ? '/' + rentalUnitTh : ''}
+            </td>
+            <td style="padding: 6px 4px; text-align: right; font-weight: bold; vertical-align: top;">${lineTotal.toLocaleString()}</td>
+          </tr>
+        `;
+    });
+    itemsDetailHtml += `</table>`;
+    // ----------------------------------------------------
+
+    const statusLabel = req.status === 'Pending Head' ? 'Level 1' : 'Level 2';
+    
+    // ⭐ แปลงชื่อประเภท (Type) ให้เป็นภาษาไทย
+    let displayType = req.type;
+    if (req.type === 'HO') {
+        displayType = req.purchaseType === 'Rent' ? 'HO (เช่า)' : 'HO (ซื้อขาด)';
+    } else if (req.type === 'Local') {
+        displayType = 'Local (ซื้อ)';
+    }
+
+    tableRows += `
+      <tr style="border-bottom: 2px solid #e0e0e0; background-color: #fff;">
+        <td style="padding: 12px; vertical-align: top; width: 15%;">
+            <div style="font-weight:bold; color:#1976d2; font-size:14px;">${req.id}</div>
+            
+            ${/* ⭐ ใช้ตัวแปร displayType ที่แปลงแล้ว */ ''}
+            <div style="font-size:11px; color:#666; margin-bottom:4px;">${displayType}</div>
+            
+            <div style="font-size:10px; background:#f5f5f5; padding:2px 6px; border-radius:4px; display:inline-block; border:1px solid #ddd;">${statusLabel}</div>
+        </td>
+        <td style="padding: 12px; vertical-align: top; width: 20%;">
+            <div style="font-weight:bold; font-size:13px;">${req.job}</div>
+            <div style="font-size:12px; color:#444; margin-top:4px;">ผู้ขอ: ${req.requester}</div>
+            <div style="font-size:11px; color:#e65100; margin-top:4px;">Due: ${req.dateRequired}</div>
+        </td>
+        <td style="padding: 12px; vertical-align: top; width: 50%;">
+            ${itemsDetailHtml}
+            <div style="text-align: right; font-size: 13px; font-weight: bold; color: #1565c0; margin-top: 5px;">
+               ยอดรวมสุทธิ: ${reqGrandTotal.toLocaleString()} บาท
+            </div>
+        </td>
+        <td style="padding: 12px; text-align: center; vertical-align: middle; width: 15%;">
+            <a href="${approveLink}" style="display:block; text-decoration:none; background:#2e7d32; color:white; padding:6px 10px; border-radius:4px; font-size:12px; font-weight:bold; margin-bottom:6px;">
+               ✓ อนุมัติ
+            </a>
+            <a href="${rejectLink}" style="display:block; text-decoration:none; background:#c62828; color:white; padding:6px 10px; border-radius:4px; font-size:12px; font-weight:bold;">
+               ✕ ไม่ผ่าน
+            </a>
+        </td>
+      </tr>
+    `;
+  });
+
+  const htmlBody = `
+    <!DOCTYPE html>
+    <html>
+    <body style="font-family: 'Sarabun', sans-serif; background-color: #f3f4f6; padding: 20px;">
+      <div style="max-width: 900px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 5px rgba(0,0,0,0.1);">
+        
+        <div style="background-color: #1976d2; padding: 20px; color: white; text-align: center;">
+          <h2 style="margin: 0; font-size: 24px;">สรุปรายการรออนุมัติประจำวัน</h2>
+          <p style="margin: 5px 0 0; opacity: 0.9;">เรียนคุณ ${user.firstName} ${user.lastName}</p>
+        </div>
+        
+        <div style="padding: 20px;">
+          <p>มีรายการรอการตรวจสอบและอนุมัติจากท่าน จำนวน <strong>${items.length}</strong> รายการ ดังนี้:</p>
+          
+          <table style="width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 25px;">
+            <thead style="background-color: #eceff1; color: #37474f; font-weight: bold;">
+              <tr>
+                <th style="padding: 10px; text-align: left;">เอกสาร</th>
+                <th style="padding: 10px; text-align: left;">โครงการ/ข้อมูล</th>
+                <th style="padding: 10px; text-align: left;">รายละเอียดสินค้า</th>
+                <th style="padding: 10px; text-align: center;">จัดการ</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${tableRows}
+            </tbody>
+          </table>
+
+          <div style="background-color: #e3f2fd; padding: 20px; border-radius: 8px; text-align: center; border: 1px dashed #90caf9;">
+            <p style="margin: 0 0 15px 0; font-weight: bold; color: #0d47a1; font-size: 16px;">⚡ ดำเนินการทั้งหมด (${items.length} รายการ)</p>
+            
+            <a href="${bulkApproveLink}" style="display:inline-block; text-decoration:none; background:#1565c0; color:white; padding:12px 30px; border-radius:6px; font-weight:bold; margin: 0 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.2);">
+               ✅ อนุมัติทั้งหมด (Approve All)
+            </a>
+            
+            <a href="${bulkRejectLink}" style="display:inline-block; text-decoration:none; background:#b71c1c; color:white; padding:12px 30px; border-radius:6px; font-weight:bold; margin: 0 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.2);">
+               ❌ ไม่อนุมัติทั้งหมด (Reject All)
+            </a>
+          </div>
+
+          <div style="text-align: center; margin-top: 25px; border-top: 1px solid #eee; padding-top: 20px;">
+            <p style="font-size: 13px; color: #666; margin-bottom: 10px;">ต้องการตรวจสอบข้อมูลต้นฉบับ ดูไฟล์แนบ หรือดูประวัติ?</p>
+            <a href="${scriptUrl}" target="_blank" style="display:inline-block; text-decoration:none; background:#455a64; color:white; padding:10px 25px; border-radius:50px; font-weight:bold; font-size: 14px; box-shadow: 0 2px 4px rgba(0,0,0,0.2);">
+                เข้าสู่ระบบเพื่อดูรายละเอียด (Open Web App)
+            </a>
+          </div>
+          
+          <div style="margin-top: 30px; text-align: center; font-size: 11px; color: #999;">
+             <p>ระบบ PurchaseHub System | อีเมลอัตโนมัติ</p>
+          </div>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  GmailApp.sendEmail(approverEmail, `[PurchaseHub] สรุปงานรออนุมัติ (${items.length} รายการ)`, '', { htmlBody: htmlBody });
+}
+
+function createBulkRejectForm(e) {
+  const ids = e.parameter.ids;
+  const approver = e.parameter.approver;
+  const scriptUrl = ScriptApp.getService().getUrl();
+
+  const html = `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <base target="_top">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: 'Sarabun', sans-serif; background-color: #f3f4f6; display: flex; justify-content: center; padding-top: 50px; }
+          .card { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 90%; max-width: 400px; }
+          h2 { color: #d93025; margin-top: 0; }
+          textarea { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 5px; margin: 15px 0; font-family: inherit; }
+          button { background-color: #d93025; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; width: 100%; font-size: 16px; }
+          button:hover { background-color: #b02015; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h2>❌ ยืนยันการไม่อนุมัติทั้งหมด</h2>
+          <p>จำนวนเอกสาร: <strong>${ids.split(',').length} รายการ</strong></p>
+          <p>กรุณาระบุเหตุผลรวม (Common Reason):</p>
+          <form id="rejectForm">
+            <textarea id="reason" rows="4" placeholder="ระบุสาเหตุที่ไม่อนุมัติ..." required></textarea>
+            <button type="submit">ยืนยัน (Confirm Reject All)</button>
+          </form>
+          <script>
+            document.getElementById('rejectForm').onsubmit = function(e) {
+              e.preventDefault();
+              var reason = document.getElementById('reason').value;
+              var btn = document.querySelector('button');
+              btn.disabled = true;
+              btn.innerText = 'กำลังบันทึก...';
+              var finalUrl = "${scriptUrl}?action=confirm_bulk_reject" + 
+                             "&ids=${ids}" + 
+                             "&approver=${approver}" + 
+                             "&role=Batch" +
+                             "&note=" + encodeURIComponent(reason);
+              window.top.location.href = finalUrl;
+            };
+          </script>
+        </div>
+      </body>
+    </html>
+  `;
+  return HtmlService.createHtmlOutput(html);
+}
+
+
+/**
+ * ฟังก์ชัน Rollback ระดับ Super Admin (ฉบับแก้ไข: ป้องกัน Rollback ซ้ำซ้อน)
+ */
+function processSuperAdminRollback(requestId, targetStatus, reason, adminInfo) {
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000);
+
+    // 1. โหลดข้อมูล
+    var requests = getSheetData('Requests');
+    var inventory = getSheetData('Inventory');
+    var assets = getSheetData('Assets');
+    
+    // ⭐ [แก้ไข] ดึง Logs มาทั้งก้อนแบบเอา id มาด้วย (เพื่อใช้อัปเดตกลับลง Supabase)
+    var logsRes = callSupabase('Logs', 'get', null, '?select=id,payload&payload-%3E%3ErelatedRequestId=eq.' + requestId);
+    var rawLogs = [];
+    try { rawLogs = JSON.parse(logsRes); } catch(e){}
+
+    var reqIndex = requests.findIndex(function(r) { return r.id === requestId; });
+    if (reqIndex === -1) throw new Error("ไม่พบเอกสาร ID: " + requestId);
+    var req = requests[reqIndex];
+
+    var logsToSave = [];
+    var logsToUpdate = []; // ⭐ [NEW] ตัวแปรสำหรับเก็บ Log เดิมที่ต้องแปะป้าย (Reverted)
+    
+    var inventoryUpdates = new Map(); 
+    var assetsToUpdate = new Map();
+    var assetsToDelete = new Set(); 
+
+    var dateStr = new Date().toLocaleString('th-TH');
+
+    // -------------------------------------------------------------------------
+    // 2. 🔄 PROCESS ROLLBACK BASED ON LOGS
+    // -------------------------------------------------------------------------
+    
+    if (rawLogs && rawLogs.length > 0) {
+      rawLogs.forEach(function(row) {
+        var log = row.payload;
+        // ข้าม Log ที่ถูก Revert ไปแล้ว
+        if (log.action.includes('(Reverted)')) return;
+
+        var isProcessed = false;
+
+        // --- A. กรณีรับของเข้า (Stock In) -> ต้องดึงออก ---
+        if (log.action.includes('Stock In') && log.assetId) {
+           var qty = 0;
+           if (log.change.includes('+')) qty = parseInt(log.change.replace('+', ''));
+           else if (log.change.includes('Start:')) qty = parseInt(log.change.split(':')[1]);
+           
+           if (qty > 0) {
+               var inv = inventory.find(function(i) { return i.id === log.assetId; });
+               if (inv) {
+                   var currentInv = inventoryUpdates.get(inv.id) || JSON.parse(JSON.stringify(inv));
+                   currentInv.qty = Math.max(0, currentInv.qty - qty);
+                   currentInv.lastUpdated = dateStr;
+                   inventoryUpdates.set(inv.id, currentInv);
+
+                   logsToSave.push({
+                       date: dateStr, action: 'Rollback (Deduct)', item: inv.name, change: '-' + qty,
+                       note: 'Rollback: ดึงยอดรับของคืน (Ref Log: ' + log.date + ')',
+                       by: adminInfo, relatedRequestId: requestId, assetId: inv.id
+                   });
+                   isProcessed = true;
+               }
+           }
+        }
+
+        // --- B. กรณีลงทะเบียนทรัพย์สิน (Register Asset) -> ต้องลบทิ้ง ---
+        else if ((log.action.includes('Register Asset') || log.action.includes('Add Asset')) && log.assetId) {
+            if (log.relatedRequestId === requestId) {
+                assetsToDelete.add(log.assetId);
+                isProcessed = true;
+            }
+        }
+
+        // --- C. กรณีเบิกออก (Withdraw) -> ต้องคืนยอดเข้า ---
+        else if (log.action.includes('Withdraw') && log.assetId) {
+            var qty = 0;
+            if (log.change.includes('-')) qty = Math.abs(parseInt(log.change));
+            
+            if (qty > 0) {
+               var inv = inventory.find(function(i) { return i.id === log.assetId; });
+               if (inv) {
+                   var currentInv = inventoryUpdates.get(inv.id) || JSON.parse(JSON.stringify(inv));
+                   currentInv.qty += qty;
+                   currentInv.lastUpdated = dateStr;
+                   inventoryUpdates.set(inv.id, currentInv);
+
+                   logsToSave.push({
+                       date: dateStr, action: 'Rollback (Return)', item: inv.name, change: '+' + qty,
+                       note: 'Rollback: คืนยอดเบิกกลับคลัง (Ref Log: ' + log.date + ')',
+                       by: adminInfo, relatedRequestId: requestId, assetId: inv.id
+                   });
+                   isProcessed = true;
+               }
+            }
+        }
+
+        // ⭐⭐⭐ ถ้า Log นี้ถูกดึงยอดไปแล้ว ให้แปะป้าย (Reverted) ป้องกันดึงซ้ำ!
+        if (isProcessed) {
+            log.action = log.action + ' (Reverted)';
+            logsToUpdate.push({ id: row.id, payload: log });
+        }
+      });
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. 🧹 FALLBACK CLEANUP (เก็บตก)
+    // -------------------------------------------------------------------------
+    
+    if (['Local', 'HO'].includes(req.type)) {
+        var linkedAssets = assets.filter(function(a) { return a.currentRequestId === req.id; });
+        linkedAssets.forEach(function(asset) {
+            if (!assetsToDelete.has(asset.id)) {
+                assetsToDelete.add(asset.id);
+            }
+        });
+    }
+
+    if (req.type === 'Borrow') {
+        var borrowedAssets = assets.filter(function(a) { return a.currentRequestId === req.id && a.status === 'Borrowed'; });
+        borrowedAssets.forEach(function(asset) {
+            if (!assetsToUpdate.has(asset.id)) {
+                var updatedAsset = JSON.parse(JSON.stringify(asset));
+                updatedAsset.status = 'Available';
+                updatedAsset.holder = '-';
+                updatedAsset.currentRequestId = null;
+                updatedAsset.lastUpdated = dateStr;
+                assetsToUpdate.set(asset.id, updatedAsset);
+
+                logsToSave.push({
+                    date: dateStr, action: 'Rollback (Free)', item: asset.name, change: 'Status: Available',
+                    note: 'Rollback: ยกเลิกการยืม',
+                    by: adminInfo, relatedRequestId: requestId, assetId: asset.id
+                });
+            }
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. 💾 SAVE CHANGES
+    // -------------------------------------------------------------------------
+
+    if (inventoryUpdates.size > 0) {
+        var invRecords = [];
+        inventoryUpdates.forEach(function(value) { invRecords.push({ id: value.id, payload: value }); });
+        var urlInv = SUPABASE_URL + '/rest/v1/inventory';
+        var optInv = {
+            method: 'post', headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY, 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates' },
+            payload: JSON.stringify(invRecords)
+        };
+        UrlFetchApp.fetch(urlInv, optInv);
+    }
+
+    if (assetsToUpdate.size > 0) {
+        var astRecords = [];
+        assetsToUpdate.forEach(function(value) { astRecords.push({ id: value.id, payload: value }); });
+        var urlAst = SUPABASE_URL + '/rest/v1/assets';
+        var optAst = {
+            method: 'post', headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY, 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates' },
+            payload: JSON.stringify(astRecords)
+        };
+        UrlFetchApp.fetch(urlAst, optAst);
+    }
+
+    if (assetsToDelete.size > 0) {
+        assetsToDelete.forEach(function(assetId) {
+            deleteDataFromSheet('Assets', assetId);
+        });
+        logsToSave.push({
+            date: dateStr, action: 'Rollback (Delete)', item: 'Multiple Assets', change: '-' + assetsToDelete.size + ' Items',
+            note: 'Rollback: ลบทรัพย์สินที่สร้างจากเอกสารนี้',
+            by: adminInfo, relatedRequestId: requestId
+        });
+    }
+
+    // 5. Manage Request History
+    var statusFlow = ['Draft', 'Pending Head', 'Pending PM', 'Pending Check', 'Approved', 'PR Issued', 'PO Issued', 'Ordered', 'Contract Pending', 'Contract Signed', 'Shipping', 'Partially Received', 'Ready to Disburse', 'Completed', 'Received', 'Returned'];
+    var targetIdx = statusFlow.indexOf(targetStatus);
+
+    if (req.history) {
+        req.history.forEach(function(h) {
+            var actionKey = h.action.replace(/ \(.+\)/, '');
+            var hIdx = statusFlow.indexOf(actionKey);
+            var isFutureStatus = (hIdx > targetIdx);
+            var isTransaction = ['Received', 'Completed', 'Partially Received', 'Returned', 'Issued', 'จ่ายของ', 'รับของ'].some(function(k) { return h.action.includes(k); });
+
+            if ((isFutureStatus || isTransaction) && !h.action.includes('(Reverted)')) {
+                h.action = h.action + " (Reverted)"; 
+            }
+        });
+    }
+
+    req.history.push({
+        date: dateStr, action: 'Rollback to ' + targetStatus, user: adminInfo + ' (Super Admin)',
+        note: 'Rollback System: ย้อนสถานะและคืนยอด (อ้างอิง Logs). เหตุผล: ' + reason
+    });
+
+    // 6. Reset Request Data
+    req.status = targetStatus;
+    req.items.forEach(function(item) {
+        item.receivedTotal = 0;
+        item.receivedLog = [];
+    });
+    saveDataToSheet('Requests', req.id, req);
+
+    // 7. Save Logs (⭐ อัปเดตทั้ง Log ใหม่ และแก้ไข Log เดิม)
+    var allLogRecordsToUpsert = [];
+    
+    // 7.1 Log ใหม่
+    if (logsToSave.length > 0) {
+        logsToSave.forEach(function(log) {
+             var logId = log.date + '_' + Math.floor(Math.random() * 100000);
+             allLogRecordsToUpsert.push({ id: logId, payload: log });
+        });
+    }
+    // 7.2 Log เดิมที่ต้องแปะป้าย (Reverted)
+    if (logsToUpdate.length > 0) {
+        logsToUpdate.forEach(function(rec) {
+             allLogRecordsToUpsert.push(rec);
+        });
+    }
+
+    if (allLogRecordsToUpsert.length > 0) {
+        var urlLog = SUPABASE_URL + '/rest/v1/logs';
+        var optLog = {
+            method: 'post', headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY, 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates' },
+            payload: JSON.stringify(allLogRecordsToUpsert)
+        };
+        UrlFetchApp.fetch(urlLog, optLog);
+    }
+
+    return { success: true, message: 'Rollback เสร็จสิ้น! ระบบดึงข้อมูลคืนและอัปเดตประวัติเรียบร้อยแล้ว', request: req };
+
+  } catch (e) {
+    console.error(e);
+    return { success: false, message: 'Rollback Error: ' + e.toString() };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+// --- HELPER: คำนวณยอดคงเหลือ Real-time สำหรับอีเมล (Logic เดียวกับ Frontend) ---
+function getStockInfoHtml(itemName, project, currentReqId, allRequests, allInventory, allAssets) {
+  let html = '';
+
+  // 1. คำนวณวัสดุ (Inventory)
+  // หาสินค้าทั้งหมดที่มีชื่อตรงกันในโครงการ
+  const stockItems = allInventory.filter(i => i.name === itemName && i.project === project);
+  
+  if (stockItems.length > 0) {
+    // รวมยอดสต็อกจริง
+    const totalStock = stockItems.reduce((sum, i) => sum + i.qty, 0);
+    const unitLabel = stockItems[0].unit;
+
+    // คำนวณยอดจอง (Reserved) จากใบเบิกอื่น (Withdraw) ที่ยังไม่จบ
+    const reservedQty = allRequests.filter(r => 
+      r.job === project && 
+      r.type === 'Withdraw' &&
+      !['Draft', 'Completed', 'Rejected', 'Returned', 'Cancelled'].includes(r.status) &&
+      r.id !== currentReqId
+    ).reduce((sum, req) => {
+      if (!req.items) return sum;
+      const match = req.items.find(i => i.name === itemName);
+      return sum + (match ? (match.qty || 0) : 0);
+    }, 0);
+
+    // ยอดพร้อมเบิก
+    const available = Math.max(0, totalStock - reservedQty);
+
+    html += `<span style="font-size:10px; color:#00796b; background-color:#e0f2f1; padding:2px 5px; border-radius:4px; display:inline-block; margin-right:4px; border:1px solid #b2dfdb;">
+               ในคลัง: <b>${available}</b> ${unitLabel}
+               ${reservedQty > 0 ? `<span style="color:#ef6c00;">(จอง ${reservedQty})</span>` : ''}
+             </span>`;
+  }
+
+  // 2. คำนวณทรัพย์สิน (Assets)
+  // นับทรัพย์สินที่สถานะ "ว่าง"
+  const availableAssetsCount = allAssets.filter(a => 
+    a.name === itemName && 
+    a.project === project && 
+    a.status === 'Available'
+  ).length;
+
+  // นับทรัพย์สินที่กำลัง "รออนุมัติยืม" (Borrow Pending)
+  const pendingBorrowCount = allRequests.filter(r => 
+    r.job === project && 
+    r.type === 'Borrow' && 
+    !['Draft', 'Completed', 'Rejected', 'Returned', 'Cancelled'].includes(r.status) &&
+    r.id !== currentReqId
+  ).reduce((sum, req) => {
+    if (!req.items) return sum;
+    const count = req.items.filter(i => i.name === itemName).length;
+    return sum + count;
+  }, 0);
+
+  // ยอดว่างจริง
+  const netAvailableAssets = Math.max(0, availableAssetsCount - pendingBorrowCount);
+
+  if (netAvailableAssets > 0 || pendingBorrowCount > 0) {
+    html += `<span style="font-size:10px; color:#283593; background-color:#e8eaf6; padding:2px 5px; border-radius:4px; display:inline-block; border:1px solid #c5cae9;">
+               ว่าง: <b>${netAvailableAssets}</b>
+               ${pendingBorrowCount > 0 ? `<span style="color:#ef6c00;">(รอคิว ${pendingBorrowCount})</span>` : ''}
+             </span>`;
+  }
+
+  return html;
+}
+
+
+
+
+// ==========================================
+// ฟังก์ชันส่งการแจ้งเตือนเข้ากลุ่ม LINE
+// ==========================================
+const LINE_ACCESS_TOKEN = PropertiesService.getScriptProperties().getProperty('LINE_ACCESS_TOKEN');
+const LINE_GROUP_APPROVE = 'Caddbe38f8930c12f37fc29c5f76861b9'; // กลุ่มรออนุมัติ
+const LINE_GROUP_STORE = '';   // กลุ่มสโตร์ (รอตัดจ่าย)
+
+function sendLineGroupNotification(req) {
+  let targetGroupId = '';
+  let displayStatus = '';
+  let headerText = '';
+
+  // 1. ตรวจสอบสถานะเพื่อกำหนดกลุ่มเป้าหมายและข้อความ
+  if (req.status === 'Pending Head') {
+    targetGroupId = LINE_GROUP_APPROVE;
+    headerText = '🔔 มีคำขอใหม่ต้องการการอนุมัติ!';
+    
+    // แยกชื่อสถานะตามประเภทเอกสาร
+    if (req.type === 'Withdraw' || req.type === 'Borrow') {
+      displayStatus = 'รออนุมัติ Level 1 / Level 2';
+    } else {
+      displayStatus = 'รออนุมัติ Level 1';
+    }
+
+  } else if (req.status === 'Ready to Disburse') {
+    targetGroupId = LINE_GROUP_STORE;
+    headerText = '📦 มีรายการรอจ่ายของ / ตัดสต็อก!';
+    displayStatus = 'รอจ่ายของ (เบิก/ยืม)';
+    
+  } else {
+    // ถ้านอกเหนือจาก 2 สถานะนี้ จะไม่ส่ง LINE ออกไป
+    return;
+  }
+
+  // 2. แปลงประเภท (Type) ให้เป็นภาษาไทยเพื่อให้อ่านง่าย
+  let displayType = req.type;
+  if (req.type === 'Local') displayType = 'สั่งซื้อ Local';
+  else if (req.type === 'HO') displayType = req.purchaseType === 'Rent' ? 'สั่งซื้อ HO (เช่า)' : 'สั่งซื้อ HO (ซื้อขาด)';
+  else if (req.type === 'Withdraw') displayType = 'เบิกวัสดุ';
+  else if (req.type === 'Borrow') displayType = 'ยืมทรัพย์สิน';
+
+  // 3. สรุปรายการสินค้า (แสดงสูงสุด 5 รายการแรก เพื่อไม่ให้ข้อความยาวเกินไป)
+  let itemsList = req.items.slice(0, 5).map((item, i) => `  ${i+1}. ${item.name} (${item.qty} ${item.unit})`).join('\n');
+  if (req.items.length > 5) {
+    itemsList += `\n  ... และอื่นๆ อีก ${req.items.length - 5} รายการ`;
+  }
+  
+  // 4. จัดรูปแบบข้อความที่จะส่ง
+  const messageText = `${headerText}\n\n` +
+                      `📌 สถานะ: ${displayStatus}\n` +
+                      `📄 เลขที่: ${req.docNumber || req.id}\n` +
+                      `🏢 โครงการ: ${req.job}\n` +
+                      `👤 ผู้ขอ: ${req.requester}\n` +
+                      `🏷️ ประเภท: ${displayType}\n` +
+                      `\n📦 รายการ:\n${itemsList}\n` +
+                      `\n👉 กรุณาเข้าสู่ระบบเพื่อตรวจสอบและดำเนินการครับ`;
+
+  // 5. ข้อมูลสำหรับยิง API
+  const url = 'https://api.line.me/v2/bot/message/push';
+  const payload = {
+    to: targetGroupId,
+    messages: [{ type: 'text', text: messageText }]
+  };
+  
+  const options = {
+    method: 'post',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + LINE_ACCESS_TOKEN
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    const res = UrlFetchApp.fetch(url, options);
+    console.log("LINE Notify Response: " + res.getContentText());
+  } catch (error) {
+    console.error("LINE Notify Error: " + error.toString());
+  }
+}
+
+function runUltimateMigration() {
+  const urlBase = SUPABASE_URL; 
+  const key = SUPABASE_KEY; 
+
+  // ⚠️ อย่าลืมใส่ ID โฟลเดอร์ให้ครบทั้ง 3 อันเหมือนเดิมนะครับ
+  const FOLDER_MAIN = '1bLG6dp7SJVEMvDudKKZnoCpriUPrJyOU';
+  const FOLDER_ASSET = '1rld-ZhQQUOpO4S2_QHRVJ46nAHURAmRf';
+  const FOLDER_SIG = '1nodI1mSwZxVN8yOWf4ycr115f8Md3Ywf';
+
+  uploadDoubleToSupabase(FOLDER_MAIN, 'purchase-hub', 'documents', urlBase, key);
+  uploadDoubleToSupabase(FOLDER_ASSET, 'purchase-hub', 'items', urlBase, key);
+  uploadDoubleToSupabase(FOLDER_SIG, 'purchase-hub', 'signatures', urlBase, key);
+}
+
+function uploadDoubleToSupabase(driveFolderId, bucketName, targetFolder, urlBase, key) {
+  if (!driveFolderId || driveFolderId.includes('ใส่_ID')) return;
+  const folder = DriveApp.getFolderById(driveFolderId);
+  const files = folder.getFiles();
+  let countId = 0, countName = 0;
+
+  while (files.hasNext()) {
+    const file = files.next();
+    const blob = file.getBlob();
+    const options = {
+      method: 'post',
+      headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': file.getMimeType() },
+      payload: blob,
+      muteHttpExceptions: true
+    };
+
+    // 🟢 แบบที่ 1: เซฟด้วย "รหัส ID" (อุดรอยรั่วตารางคำขอ/Logs)
+    const fileId = file.getId();
+    const url1 = `${urlBase}/storage/v1/object/${bucketName}/${targetFolder}/${fileId}`;
+    const res1 = UrlFetchApp.fetch(url1, options);
+    if (res1.getResponseCode() === 200 || res1.getResponseCode() === 201) countId++;
+
+    // 🔵 แบบที่ 2: เซฟด้วย "ชื่อไฟล์" (อุดรอยรั่วตารางทรัพย์สิน/สต็อก)
+    const encodedName = encodeURIComponent(file.getName());
+    const url2 = `${urlBase}/storage/v1/object/${bucketName}/${targetFolder}/${encodedName}`;
+    const res2 = UrlFetchApp.fetch(url2, options);
+    if (res2.getResponseCode() === 200 || res2.getResponseCode() === 201) countName++;
+  }
+  Logger.log(`✅ โฟลเดอร์ /${targetFolder} -> อัปด้วย ID: ${countId} | อัปด้วยชื่อ: ${countName}`);
+}
+
+
